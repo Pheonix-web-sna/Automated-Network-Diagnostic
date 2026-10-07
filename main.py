@@ -1,528 +1,693 @@
 """
-Automated Network Diagnostic and Connectivity Analysis Framework
-Main GUI Application using Tkinter
+main.py — IntelliNet Application (Phase 3)
+Intelligent Network Health & Diagnostics System
 
-Author: College Academic Project
-Target Platform: Windows 10/11
+Architecture:
+  - Multi-page responsive desktop interface using Tkinter.
+  - Sidebar navigation: Dashboard, Diagnostics, Network Info, Performance,
+    Recommendations, History, Monitoring.
+  - Multi-threaded diagnostic engine with thread-safe queue.Queue event loop.
+  - Background monitoring thread with configurable scan interval.
+  - SQLite persistent storage for diagnostic history, metrics, and events.
+  - Automatic network degradation detection with alert system.
+  - Zero hardcoding — all data is retrieved live from the local network stack.
 """
 
 import tkinter as tk
-from tkinter import ttk, messagebox, filedialog
+from tkinter import ttk, messagebox
 import threading
+import queue
 import time
 import sys
 import os
 
-# Ensure local imports work regardless of execution directory
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+# Ensure local imports work regardless of working directory
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import config as cfg
 import network_diagnostics as nd
+import performance as perf
+import collector
+import db_manager as db
+from models import PerformanceMetrics, WiFiInfo, DiagnosticResult
+
+# Import View Components
+from sidebar import Sidebar
+from dashboard_view import DashboardView
+from diagnostics_view import DiagnosticsView
+from network_info_view import NetworkInfoView
+from performance_view import PerformanceView
+from recommendations_view import RecommendationsView
+from history_view import HistoryView
+from monitoring_view import MonitoringView
 
 
-class NetworkDiagnosticApp:
-    def __init__(self, root):
+class IntelliNetApp:
+    """
+    IntelliNet Application Coordinator (Phase 3).
+    Manages pages, navigation, thread-safe async diagnostic worker,
+    live UI synchronization, background monitoring, database persistence,
+    and degradation detection across all dashboard views.
+    """
+
+    PAGE_TITLES = {
+        "dashboard": ("Dashboard", "Real-Time System Overview & Network Health Score"),
+        "diagnostics": ("Live Diagnostics", "8-Step Layer-by-Layer Automated Network Diagnostic Engine"),
+        "network_info": ("Network Information", "Physical Adapter, IP Addressing, Wi-Fi Link & Traffic Counters"),
+        "performance": ("Performance Analytics", "Multi-Ping Latency, Jitter, Packet Loss & Usability Assessment"),
+        "recommendations": ("Recommendations & RCA", "Root Cause Analysis, Confidence Metric & Remediation Steps"),
+        "history": ("Diagnostic History", "Historical Trends, Charts & Session Archive (SQLite)"),
+        "monitoring": ("Network Monitoring", "Continuous Background Scanning, Event Log & Degradation Alerts"),
+    }
+
+    def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("Automated Network Diagnostic & Connectivity Analysis Framework")
-        self.root.geometry("860x780")
-        self.root.minsize(780, 680)
+        self.root.title(f"{cfg.APP_NAME} — {cfg.APP_SUBTITLE}")
+        self.root.geometry(f"{cfg.WINDOW_WIDTH}x{cfg.WINDOW_HEIGHT}")
+        self.root.minsize(cfg.WINDOW_MIN_WIDTH, cfg.WINDOW_MIN_HEIGHT)
+        self.root.configure(bg=cfg.COLOR_BG)
 
-        # Apply Modern Color Scheme (Dark Slate / Deep Navy)
-        self.COLOR_BG = "#0F172A"         # Main background
-        self.COLOR_PANEL = "#1E293B"      # Panel background
-        self.COLOR_PANEL_ALT = "#334155"  # Secondary panel / border
-        self.COLOR_ACCENT = "#0EA5E9"     # Sky blue primary accent
-        self.COLOR_ACCENT_HOVER = "#0284C7"
-        self.COLOR_TEXT_PRIMARY = "#F8FAFC"
-        self.COLOR_TEXT_MUTED = "#94A3B8"
-        self.COLOR_SUCCESS = "#22C55E"    # Green
-        self.COLOR_FAILURE = "#EF4444"    # Red
-        self.COLOR_WARNING = "#F59E0B"    # Amber
-
-        self.root.configure(bg=self.COLOR_BG)
-
-        # Diagnostic state store
         self.is_running = False
-        self.diagnostic_data = None
+        self.diagnostic_data: DiagnosticResult = None
+        self.ui_queue = queue.Queue()
 
-        self._setup_styles()
-        self._build_ui()
+        # Monitoring state
+        self._monitor_active = False
+        self._monitor_thread: threading.Thread = None
+        self._monitor_stop_event = threading.Event()
+        self._monitor_scan_count = 0
+        self._monitor_alert_count = 0
 
-    def _setup_styles(self):
-        """Configure ttk styles for Treeview and Progressbar."""
-        self.style = ttk.Style()
-        self.style.theme_use("clam")
+        self._setup_ttk_styles()
+        self._build_layout()
+        self._poll_ui_queue()
 
-        # Table (Treeview) styling
-        self.style.configure(
-            "Custom.Treeview",
-            background=self.COLOR_PANEL,
-            foreground=self.COLOR_TEXT_PRIMARY,
-            fieldbackground=self.COLOR_PANEL,
-            rowheight=38,
-            font=("Segoe UI", 11)
+        # Log application startup
+        db.log_event("SYSTEM", "IntelliNet application started", severity="INFO")
+
+        # Trigger automatic initial network scan on launch
+        self.root.after(300, self.start_diagnostic)
+
+    # ── TTK Styles ──────────────────────────────────────────────────────────
+
+    def _setup_ttk_styles(self):
+        style = ttk.Style()
+        style.theme_use("clam")
+
+        # Sleek Sky-Blue Progressbar
+        style.configure(
+            "Intellinet.Horizontal.TProgressbar",
+            troughcolor=cfg.COLOR_PANEL_DARK,
+            background=cfg.COLOR_ACCENT,
+            darkcolor=cfg.COLOR_ACCENT,
+            lightcolor=cfg.COLOR_ACCENT,
+            bordercolor=cfg.COLOR_PANEL_ALT,
+            thickness=5,
         )
-        self.style.configure(
-            "Custom.Treeview.Heading",
-            background="#090D16",
-            foreground="#38BDF8",
-            font=("Segoe UI", 11, "bold"),
-            borderwidth=0
-        )
-        self.style.map("Custom.Treeview", background=[("selected", "#334155")])
 
-        # Progressbar styling
-        self.style.configure(
-            "Custom.Horizontal.TProgressbar",
-            troughcolor=self.COLOR_PANEL,
-            bordercolor=self.COLOR_PANEL,
-            background=self.COLOR_ACCENT,
-            thickness=8
+        style.configure(
+            "Vertical.TScrollbar",
+            troughcolor=cfg.COLOR_PANEL_DARK,
+            background=cfg.COLOR_PANEL_ALT,
+            arrowcolor=cfg.COLOR_TEXT_MUTED,
+            relief="flat",
         )
 
-    def _build_ui(self):
-        """Construct GUI layout."""
-        # ------------------- HEADER -------------------
-        header_frame = tk.Frame(self.root, bg=self.COLOR_BG, pady=15, padx=25)
-        header_frame.pack(fill="x")
+    # ── Layout Construction ──────────────────────────────────────────────────
 
-        title_lbl = tk.Label(
-            header_frame,
-            text="AUTOMATED NETWORK DIAGNOSTIC\n& CONNECTIVITY ANALYSIS",
-            font=("Segoe UI", 18, "bold"),
-            fg=self.COLOR_TEXT_PRIMARY,
-            bg=self.COLOR_BG,
-            justify="center"
+    def _build_layout(self):
+        # Master container
+        self.main_container = tk.Frame(self.root, bg=cfg.COLOR_BG)
+        self.main_container.pack(fill="both", expand=True)
+
+        # 1. Left Sidebar
+        self.sidebar = Sidebar(
+            self.main_container,
+            on_navigate=self.show_page,
         )
-        title_lbl.pack()
+        self.sidebar.pack(side="left", fill="y")
 
-        subtitle_lbl = tk.Label(
-            header_frame,
-            text="Development of an Automated Network Diagnostic and Connectivity Analysis Framework",
-            font=("Segoe UI", 10, "italic"),
-            fg=self.COLOR_ACCENT,
-            bg=self.COLOR_BG
+        # 2. Right Content Area (Header + Switchable Pages)
+        self.content_area = tk.Frame(self.main_container, bg=cfg.COLOR_BG)
+        self.content_area.pack(side="left", fill="both", expand=True)
+
+        self._build_header()
+        self._build_pages()
+
+    def _build_header(self):
+        """Top Application Header with dynamic titles, status message, and Run CTA."""
+        self.header_frame = tk.Frame(self.content_area, bg=cfg.COLOR_PANEL, padx=24, pady=12)
+        self.header_frame.pack(fill="x")
+
+        # Left: Titles
+        title_box = tk.Frame(self.header_frame, bg=cfg.COLOR_PANEL)
+        title_box.pack(side="left", fill="y")
+
+        self.lbl_page_title = tk.Label(
+            title_box,
+            text="Dashboard",
+            font=("Segoe UI", 16, "bold"),
+            bg=cfg.COLOR_PANEL,
+            fg=cfg.COLOR_TEXT_PRIMARY,
         )
-        subtitle_lbl.pack(pady=(4, 0))
+        self.lbl_page_title.pack(anchor="w")
 
-        # Divider line
-        divider = tk.Frame(self.root, bg=self.COLOR_PANEL_ALT, height=2)
-        divider.pack(fill="x", padx=25, pady=5)
+        self.lbl_page_subtitle = tk.Label(
+            title_box,
+            text="Real-Time System Overview & Network Health Score",
+            font=("Segoe UI", 8),
+            bg=cfg.COLOR_PANEL,
+            fg=cfg.COLOR_TEXT_MUTED,
+        )
+        self.lbl_page_subtitle.pack(anchor="w", pady=(1, 0))
 
-        # ------------------- ACTION BAR (RUN BUTTON) -------------------
-        self.action_frame = tk.Frame(self.root, bg=self.COLOR_BG, pady=10)
-        self.action_frame.pack(fill="x", padx=25)
+        # Right: Action CTA & Status Indicator
+        action_box = tk.Frame(self.header_frame, bg=cfg.COLOR_PANEL)
+        action_box.pack(side="right", fill="y")
+
+        self.lbl_status = tk.Label(
+            action_box,
+            text="Ready to scan",
+            font=("Segoe UI", 9),
+            bg=cfg.COLOR_PANEL,
+            fg=cfg.COLOR_TEXT_MUTED,
+        )
+        self.lbl_status.pack(side="left", padx=(0, 16))
 
         self.btn_run = tk.Button(
-            self.action_frame,
-            text="▶  RUN NETWORK DIAGNOSTIC",
-            font=("Segoe UI", 12, "bold"),
+            action_box,
+            text="▶  Run Diagnostics",
+            font=("Segoe UI", 9, "bold"),
+            bg=cfg.COLOR_ACCENT,
             fg="#FFFFFF",
-            bg=self.COLOR_ACCENT,
-            activebackground=self.COLOR_ACCENT_HOVER,
+            activebackground=cfg.COLOR_ACCENT_HOVER,
             activeforeground="#FFFFFF",
-            bd=0,
-            padx=24,
-            pady=10,
+            relief="flat",
             cursor="hand2",
-            command=self.start_diagnostic
+            command=self.start_diagnostic,
+            padx=16,
+            pady=7,
         )
-        self.btn_run.pack()
+        self.btn_run.pack(side="left")
 
-        # Status text & Progress Bar
-        self.status_lbl = tk.Label(
-            self.action_frame,
-            text="System ready. Click button above to initiate diagnostics.",
-            font=("Segoe UI", 10),
-            fg=self.COLOR_TEXT_MUTED,
-            bg=self.COLOR_BG
-        )
-        self.status_lbl.pack(pady=(8, 4))
-
+        # Top Progress Bar
         self.progress_bar = ttk.Progressbar(
-            self.action_frame,
-            style="Custom.Horizontal.TProgressbar",
+            self.content_area,
+            style="Intellinet.Horizontal.TProgressbar",
             orient="horizontal",
             mode="determinate",
-            length=600
+            maximum=100,
         )
-        self.progress_bar.pack(pady=4)
+        self.progress_bar.pack(fill="x")
 
-        # ------------------- RESULTS TABLE -------------------
-        table_container = tk.Frame(self.root, bg=self.COLOR_PANEL, bd=1, relief="solid")
-        table_container.pack(fill="both", expand=True, padx=25, pady=10)
+    def _build_pages(self):
+        """Instantiate all 7 views and keep them ready for instant switching."""
+        self.page_container = tk.Frame(self.content_area, bg=cfg.COLOR_BG)
+        self.page_container.pack(fill="both", expand=True)
 
-        columns = ("check", "status", "details")
-        self.tree = ttk.Treeview(
-            table_container,
-            columns=columns,
-            show="headings",
-            style="Custom.Treeview",
-            selectmode="none"
+        self.pages = {}
+
+        # 1. Dashboard View
+        self.pages["dashboard"] = DashboardView(
+            self.page_container,
+            on_view_recommendations=lambda: self.show_page("recommendations"),
         )
-        
-        self.tree.heading("check", text="  CHECK", anchor="w")
-        self.tree.heading("status", text="STATUS", anchor="center")
-        self.tree.heading("details", text="DETAILS", anchor="w")
 
-        self.tree.column("check", width=220, anchor="w")
-        self.tree.column("status", width=110, anchor="center")
-        self.tree.column("details", width=440, anchor="w")
+        # 2. Diagnostics View
+        self.pages["diagnostics"] = DiagnosticsView(self.page_container)
 
-        self.tree.pack(fill="both", expand=True, padx=2, pady=2)
+        # 3. Network Information View
+        self.pages["network_info"] = NetworkInfoView(self.page_container)
 
-        # Configure row colors tag
-        self.tree.tag_configure("pass", foreground=self.COLOR_SUCCESS)
-        self.tree.tag_configure("fail", foreground=self.COLOR_FAILURE)
+        # 4. Performance View
+        self.pages["performance"] = PerformanceView(self.page_container)
 
-        # Populate empty table template
-        self._populate_empty_table()
-
-        # ------------------- DIAGNOSIS CARD -------------------
-        diag_card = tk.Frame(self.root, bg=self.COLOR_PANEL, bd=1, relief="solid")
-        diag_card.pack(fill="x", padx=25, pady=(0, 10))
-
-        # Card Title Header
-        card_header = tk.Frame(diag_card, bg=self.COLOR_PANEL_ALT, pady=6, padx=15)
-        card_header.pack(fill="x")
-
-        tk.Label(
-            card_header,
-            text="DIAGNOSIS & RECOMMENDATION REPORT",
-            font=("Segoe UI", 10, "bold"),
-            fg=self.COLOR_TEXT_PRIMARY,
-            bg=self.COLOR_PANEL_ALT
-        ).pack(side="left")
-
-        self.overall_badge = tk.Label(
-            card_header,
-            text="STATUS: READY",
-            font=("Segoe UI", 9, "bold"),
-            fg=self.COLOR_TEXT_MUTED,
-            bg=self.COLOR_PANEL_ALT
+        # 5. Recommendations View
+        self.pages["recommendations"] = RecommendationsView(
+            self.page_container,
+            on_retest=self.start_diagnostic,
         )
-        self.overall_badge.pack(side="right")
 
-        # Card Content Frame
-        card_body = tk.Frame(diag_card, bg=self.COLOR_PANEL, pady=12, padx=15)
-        card_body.pack(fill="x")
+        # 6. History View (Phase 3)
+        self.pages["history"] = HistoryView(self.page_container)
 
-        # Diagnosis Row
-        tk.Label(
-            card_body,
-            text="DIAGNOSIS:",
-            font=("Segoe UI", 10, "bold"),
-            fg=self.COLOR_ACCENT,
-            bg=self.COLOR_PANEL,
-            anchor="w"
-        ).grid(row=0, column=0, sticky="nw", pady=2)
-
-        self.diag_val_lbl = tk.Label(
-            card_body,
-            text="No diagnostic data available yet. Please run the diagnostic process.",
-            font=("Segoe UI", 10),
-            fg=self.COLOR_TEXT_PRIMARY,
-            bg=self.COLOR_PANEL,
-            anchor="w",
-            wraplength=650,
-            justify="left"
+        # 7. Monitoring View (Phase 3)
+        self.pages["monitoring"] = MonitoringView(
+            self.page_container,
+            on_start_monitor=self._start_monitoring,
+            on_stop_monitor=self._stop_monitoring,
         )
-        self.diag_val_lbl.grid(row=0, column=1, sticky="w", padx=(10, 0), pady=2)
 
-        # Recommendation Row
-        tk.Label(
-            card_body,
-            text="RECOMMENDATION:",
-            font=("Segoe UI", 10, "bold"),
-            fg=self.COLOR_SUCCESS,
-            bg=self.COLOR_PANEL,
-            anchor="w"
-        ).grid(row=1, column=0, sticky="nw", pady=(8, 2))
+        # Show initial page
+        self.current_page = None
+        self.show_page("dashboard")
 
-        self.rec_val_lbl = tk.Label(
-            card_body,
-            text="N/A",
-            font=("Segoe UI", 10),
-            fg=self.COLOR_TEXT_PRIMARY,
-            bg=self.COLOR_PANEL,
-            anchor="w",
-            wraplength=650,
-            justify="left"
-        )
-        self.rec_val_lbl.grid(row=1, column=1, sticky="w", padx=(10, 0), pady=(8, 2))
+    def show_page(self, page_id: str):
+        """Switch between the 7 dashboard pages with smooth transitions."""
+        if page_id not in self.pages:
+            return
 
-        # ------------------- FOOTER ACTION BUTTONS -------------------
-        footer = tk.Frame(self.root, bg=self.COLOR_BG, pady=10, padx=25)
-        footer.pack(fill="x")
+        # Hide current page
+        if self.current_page and self.current_page in self.pages:
+            self.pages[self.current_page].pack_forget()
 
-        self.btn_re_run = tk.Button(
-            footer,
-            text="🔄  RUN AGAIN",
-            font=("Segoe UI", 10, "bold"),
-            fg="#FFFFFF",
-            bg=self.COLOR_PANEL_ALT,
-            activebackground=self.COLOR_ACCENT,
-            activeforeground="#FFFFFF",
-            bd=0,
-            padx=16,
-            pady=6,
-            cursor="hand2",
-            state="disabled",
-            command=self.start_diagnostic
-        )
-        self.btn_re_run.pack(side="left", padx=(0, 10))
+        # Show target page
+        self.pages[page_id].pack(fill="both", expand=True)
+        self.current_page = page_id
 
-        self.btn_save = tk.Button(
-            footer,
-            text="📋  SAVE REPORT",
-            font=("Segoe UI", 10, "bold"),
-            fg="#FFFFFF",
-            bg=self.COLOR_PANEL_ALT,
-            activebackground=self.COLOR_ACCENT,
-            activeforeground="#FFFFFF",
-            bd=0,
-            padx=16,
-            pady=6,
-            cursor="hand2",
-            state="disabled",
-            command=self.save_report
-        )
-        self.btn_save.pack(side="left")
+        # Update Sidebar active state
+        self.sidebar.set_active(page_id)
 
-        self.btn_exit = tk.Button(
-            footer,
-            text="❌  EXIT",
-            font=("Segoe UI", 10, "bold"),
-            fg="#FFFFFF",
-            bg=self.COLOR_FAILURE,
-            activebackground="#DC2626",
-            activeforeground="#FFFFFF",
-            bd=0,
-            padx=16,
-            pady=6,
-            cursor="hand2",
-            command=self.root.quit
-        )
-        self.btn_exit.pack(side="right")
+        # Update Header title & subtitle
+        title, sub = self.PAGE_TITLES.get(page_id, ("IntelliNet", ""))
+        self.lbl_page_title.config(text=title)
+        self.lbl_page_subtitle.config(text=sub)
 
-    def _populate_empty_table(self):
-        """Display initial empty state in Treeview table."""
-        for item in self.tree.get_children():
-            self.tree.delete(item)
+        # Re-sync data if available
+        if self.diagnostic_data:
+            self.pages[page_id].update_data(self.diagnostic_data)
 
-        initial_rows = [
-            ("Network Adapter", "--", "Pending diagnostic run..."),
-            ("IP Address", "--", "Pending diagnostic run..."),
-            ("Default Gateway", "--", "Pending diagnostic run..."),
-            ("DNS Resolution", "--", "Pending diagnostic run..."),
-            ("Internet Connectivity", "--", "Pending diagnostic run...")
-        ]
-        for row in initial_rows:
-            self.tree.insert("", "end", values=row)
+    # ── Thread-Safe Event Queue ──────────────────────────────────────────────
+
+    def _poll_ui_queue(self):
+        """Process pending UI updates from worker threads on the main GUI thread."""
+        try:
+            while True:
+                fn = self.ui_queue.get_nowait()
+                try:
+                    fn()
+                except Exception:
+                    pass
+        except queue.Empty:
+            pass
+        self.root.after(40, self._poll_ui_queue)
+
+    def _dispatch_ui(self, fn):
+        """Post a callable onto the UI queue."""
+        self.ui_queue.put(fn)
+
+    # ── Diagnostic Execution Engine ──────────────────────────────────────────
 
     def start_diagnostic(self):
-        """Initiate diagnostic in a background thread."""
+        """Trigger background diagnostic run."""
         if self.is_running:
             return
 
         self.is_running = True
-        self.btn_run.config(state="disabled", bg=self.COLOR_PANEL_ALT)
-        self.btn_re_run.config(state="disabled")
-        self.btn_save.config(state="disabled")
-
+        self.btn_run.config(state="disabled", bg=cfg.COLOR_PANEL_ALT)
         self.progress_bar["value"] = 0
-        self.status_lbl.config(fg=self.COLOR_ACCENT, text="Starting diagnostic workflow...")
+        self.lbl_status.config(text="Scanning network...", fg=cfg.COLOR_WARNING)
 
-        # Clear diagnosis box
-        self.overall_badge.config(text="STATUS: TESTING...", fg=self.COLOR_WARNING)
-        self.diag_val_lbl.config(text="Diagnostic in progress...")
-        self.rec_val_lbl.config(text="Diagnostic in progress...")
+        # Reset Diagnostics page table
+        diag_view: DiagnosticsView = self.pages["diagnostics"]
+        diag_view.reset_table()
+        diag_view.append_log("Starting automated diagnostic sequence...")
 
-        # Launch background thread
-        threading.Thread(target=self._run_diagnostic_workflow, daemon=True).start()
-
-    def _update_tree_row(self, index, check_name, status_symbol, details, is_success):
-        """Safely update a specific row in the Treeview."""
-        children = self.tree.get_children()
-        if index < len(children):
-            item_id = children[index]
-            tag = "pass" if is_success else "fail"
-            self.tree.item(item_id, values=(f"  {check_name}", status_symbol, details), tags=(tag,))
-
-    def _run_diagnostic_workflow(self):
-        """Executed on background thread to prevent UI freezing."""
-        try:
-            # Step 1: Check Network Adapter
-            self.root.after(0, lambda: self.status_lbl.config(text="Checking network adapter..."))
-            self.root.after(0, lambda: self.progress_bar.config(value=15))
-            adapter_res = nd.get_active_adapter()
-            time.sleep(0.4)
-
-            adapter_ok, adapter_name, adapter_det = adapter_res
-            symbol_1 = "✓" if adapter_ok else "✗"
-            self.root.after(
-                0, lambda: self._update_tree_row(0, "Network Adapter", symbol_1, adapter_name, adapter_ok)
-            )
-
-            # Step 2: Check IP Address
-            self.root.after(0, lambda: self.status_lbl.config(text="Checking IP address..."))
-            self.root.after(0, lambda: self.progress_bar.config(value=35))
-            ip_res = nd.get_ipv4_address(adapter_name if adapter_ok else None)
-            time.sleep(0.4)
-
-            ip_ok, ip_addr, ip_det = ip_res
-            symbol_2 = "✓" if ip_ok else "✗"
-            self.root.after(
-                0, lambda: self._update_tree_row(1, "IP Address", symbol_2, ip_det, ip_ok)
-            )
-
-            # Step 3: Check Default Gateway
-            self.root.after(0, lambda: self.status_lbl.config(text="Checking default gateway..."))
-            self.root.after(0, lambda: self.progress_bar.config(value=55))
-            gateway_res = nd.check_gateway()
-            time.sleep(0.4)
-
-            gw_has, gw_ip, gw_reachable, gw_disp = gateway_res
-            symbol_3 = "✓" if (gw_has and gw_reachable) else "✗"
-            self.root.after(
-                0, lambda: self._update_tree_row(2, "Default Gateway", symbol_3, gw_disp, gw_has and gw_reachable)
-            )
-
-            # Step 4: Check DNS Resolution
-            self.root.after(0, lambda: self.status_lbl.config(text="Testing DNS..."))
-            self.root.after(0, lambda: self.progress_bar.config(value=75))
-            dns_res = nd.check_dns("google.com")
-            time.sleep(0.4)
-
-            dns_ok, dns_status, dns_det = dns_res
-            symbol_4 = "✓" if dns_ok else "✗"
-            self.root.after(
-                0, lambda: self._update_tree_row(3, "DNS Resolution", symbol_4, dns_status, dns_ok)
-            )
-
-            # Step 5: Check Internet Connectivity
-            self.root.after(0, lambda: self.status_lbl.config(text="Testing internet connectivity..."))
-            self.root.after(0, lambda: self.progress_bar.config(value=90))
-            internet_res = nd.check_internet("8.8.8.8")
-            time.sleep(0.4)
-
-            inet_ok, inet_status, inet_det = internet_res
-            symbol_5 = "✓" if inet_ok else "✗"
-            self.root.after(
-                0, lambda: self._update_tree_row(4, "Internet Connectivity", symbol_5, inet_status, inet_ok)
-            )
-
-            # Step 6 & 7 & 8: Analyze & Diagnose
-            self.root.after(0, lambda: self.status_lbl.config(text="Analyzing results..."))
-            self.root.after(0, lambda: self.progress_bar.config(value=100))
-            diag = nd.diagnose_network(adapter_res, ip_res, gateway_res, dns_res, internet_res)
-            time.sleep(0.3)
-
-            # Store result for save feature
-            self.diagnostic_data = {
-                "adapter": adapter_res,
-                "ip": ip_res,
-                "gateway": gateway_res,
-                "dns": dns_res,
-                "internet": internet_res,
-                "diagnosis": diag
-            }
-
-            # Update UI with diagnosis results
-            self.root.after(0, lambda: self._finalize_ui_state(diag))
-
-        except Exception as e:
-            self.root.after(0, lambda: self._handle_error(str(e)))
-
-    def _finalize_ui_state(self, diag):
-        """Update diagnosis display and restore action buttons on main thread."""
-        self.is_running = False
-        self.btn_run.config(state="normal", bg=self.COLOR_ACCENT)
-        self.btn_re_run.config(state="normal")
-        self.btn_save.config(state="normal")
-        self.status_lbl.config(fg=self.COLOR_SUCCESS, text="Diagnostic completed successfully!")
-
-        overall = diag["overall_status"]
-        if "NORMAL" in overall or "HEALTHY" in overall:
-            badge_fg = self.COLOR_SUCCESS
-        elif "CRITICAL" in overall:
-            badge_fg = self.COLOR_FAILURE
-        else:
-            badge_fg = self.COLOR_WARNING
-
-        self.overall_badge.config(text=f"OVERALL STATUS: {overall}", fg=badge_fg)
-        self.diag_val_lbl.config(text=diag["diagnosis"])
-        self.rec_val_lbl.config(text=diag["recommendation"])
-
-    def _handle_error(self, err_msg):
-        """Handle exceptions gracefully."""
-        self.is_running = False
-        self.btn_run.config(state="normal", bg=self.COLOR_ACCENT)
-        self.btn_re_run.config(state="normal")
-        self.status_lbl.config(fg=self.COLOR_FAILURE, text=f"Diagnostic error: {err_msg}")
-        messagebox.showerror("Diagnostic Error", f"An unexpected error occurred:\n{err_msg}")
-
-    def save_report(self):
-        """Save diagnostic results to a text file."""
-        if not self.diagnostic_data:
-            messagebox.showinfo("Save Report", "No diagnostic data to save.")
-            return
-
-        file_path = filedialog.asksaveasfilename(
-            defaultextension=".txt",
-            filetypes=[("Text Files", "*.txt"), ("All Files", "*.*")],
-            initialfile="network_diagnostic_report.txt",
-            title="Save Diagnostic Report"
+        # Update sidebar footer
+        self.sidebar.update_status(
+            self.diagnostic_data.adapter.name if self.diagnostic_data else "Scanning",
+            is_running=True,
+            is_healthy=True,
         )
-        if not file_path:
+
+        threading.Thread(target=self._run_diagnostic_worker, daemon=True).start()
+
+    def _run_diagnostic_worker(self):
+        """
+        Worker thread: sequentially executes all real network probes,
+        posting live progress and log updates to the UI queue.
+        """
+        try:
+            diag_view: DiagnosticsView = self.pages["diagnostics"]
+
+            def update_step(step_idx, status_text, sym, details, tag, log_msg):
+                self._dispatch_ui(lambda: diag_view.set_row_result(step_idx, sym, details, tag))
+                self._dispatch_ui(lambda: diag_view.append_log(log_msg))
+
+            def set_status(text, col=cfg.COLOR_TEXT_PRIMARY):
+                self._dispatch_ui(lambda: self.lbl_status.config(text=text, fg=col))
+
+            def set_progress(val):
+                self._dispatch_ui(lambda: self.progress_bar.config(value=val))
+
+            # ── Step 1: Network Adapter ──────────────────────────────
+            set_status("Detecting network adapter...", cfg.COLOR_ACCENT)
+            set_progress(10)
+            self._dispatch_ui(lambda: diag_view.set_row_testing(0))
+            time.sleep(0.15)
+
+            adapter_res = nd.get_active_adapter()
+            a_ok, a_name, a_det = adapter_res
+            sym = "✓" if a_ok else "✗"
+            tag = "pass" if a_ok else "fail"
+            update_step(0, "Active" if a_ok else "Failed", sym, a_det, tag,
+                        f"Step 1: Network Adapter -> {a_name} ({'UP' if a_ok else 'DOWN'})")
+
+            # ── Step 2: IPv4 Address ─────────────────────────────────
+            set_status("Detecting IPv4 configuration...", cfg.COLOR_ACCENT)
+            set_progress(24)
+            self._dispatch_ui(lambda: diag_view.set_row_testing(1))
+            time.sleep(0.15)
+
+            ip_res = nd.get_ipv4_address(a_name if a_ok else None)
+            ip_ok, ip_addr, ip_det = ip_res
+            sym = "✓" if ip_ok else "✗"
+            tag = "pass" if ip_ok else "fail"
+            update_step(1, "Assigned" if ip_ok else "Failed", sym, ip_det, tag,
+                        f"Step 2: IPv4 Address -> {ip_addr}")
+
+            # ── Step 3: Default Gateway ──────────────────────────────
+            set_status("Checking default gateway reachability...", cfg.COLOR_ACCENT)
+            set_progress(38)
+            self._dispatch_ui(lambda: diag_view.set_row_testing(2))
+            time.sleep(0.15)
+
+            gw_res = nd.check_gateway()
+            gw_has, gw_ip, gw_reach, gw_disp = gw_res
+            gw_ok = gw_has and gw_reach
+            sym = "✓" if gw_ok else "✗"
+            tag = "pass" if gw_ok else ("warn" if gw_has else "fail")
+            update_step(2, "Reachable" if gw_ok else "Unreachable", sym, gw_disp, tag,
+                        f"Step 3: Default Gateway -> {gw_ip} ({'Reachable' if gw_reach else 'Unreachable'})")
+
+            # ── Step 4: Wi-Fi Parameters ─────────────────────────────
+            set_status("Querying Wi-Fi & physical link parameters...", cfg.COLOR_ACCENT)
+            set_progress(50)
+            self._dispatch_ui(lambda: diag_view.set_row_testing(3))
+            time.sleep(0.15)
+
+            wifi_info: WiFiInfo = nd.get_wifi_info()
+            w_sym = "✓" if wifi_info.is_wifi else "ℹ"
+            w_tag = "pass" if wifi_info.is_wifi else "info"
+            w_det = wifi_info.display if wifi_info.display else ("Connected" if a_ok else "No Link")
+            update_step(3, "Connected", w_sym, w_det, w_tag,
+                        f"Step 4: Wi-Fi / Link -> {w_det}")
+
+            # ── Step 5: DNS Resolution ───────────────────────────────
+            set_status(f"Resolving DNS ({cfg.DNS_TEST_DOMAIN})...", cfg.COLOR_ACCENT)
+            set_progress(64)
+            self._dispatch_ui(lambda: diag_view.set_row_testing(4))
+            time.sleep(0.15)
+
+            dns_res = nd.check_dns(cfg.DNS_TEST_DOMAIN)
+            dns_ok, dns_status, dns_det = dns_res
+            sym = "✓" if dns_ok else "✗"
+            tag = "pass" if dns_ok else "fail"
+            update_step(4, dns_status, sym, dns_det, tag,
+                        f"Step 5: DNS Resolution -> {dns_det}")
+
+            # ── Step 6: Internet Connectivity ────────────────────────
+            set_status(f"Testing WAN internet connectivity ({cfg.PING_TARGET_PRIMARY})...", cfg.COLOR_ACCENT)
+            set_progress(76)
+            self._dispatch_ui(lambda: diag_view.set_row_testing(5))
+            time.sleep(0.15)
+
+            inet_res = nd.check_internet(cfg.PING_TARGET_PRIMARY)
+            inet_ok, inet_status, inet_det = inet_res
+            sym = "✓" if inet_ok else "✗"
+            tag = "pass" if inet_ok else "fail"
+            update_step(5, inet_status, sym, inet_det, tag,
+                        f"Step 6: Internet Access -> {inet_det}")
+
+            # ── Step 7 & 8: Performance Measurement ──────────────────
+            set_status("Measuring latency & packet loss (4 ICMP pings)...", cfg.COLOR_TEAL)
+            set_progress(88)
+            self._dispatch_ui(lambda: diag_view.set_row_testing(6))
+            self._dispatch_ui(lambda: diag_view.set_row_testing(7))
+
+            target = cfg.PING_TARGET_PRIMARY if inet_ok else (gw_ip if gw_reach else "")
+            if target:
+                perf_metrics = perf.measure_performance(target, cfg.PING_COUNT, cfg.PING_TIMEOUT_MS)
+            else:
+                perf_metrics = PerformanceMetrics(
+                    avg_latency_ms=-1, min_latency_ms=-1, max_latency_ms=-1,
+                    jitter_ms=-1, packet_loss_pct=100.0, ping_count=0,
+                    target_host="", error="No reachable host for performance test"
+                )
+
+            # Update Latency Row (Step 7)
+            if perf_metrics.is_valid:
+                lat_tag = "pass" if perf_metrics.avg_latency_ms <= cfg.LATENCY_FAIR_MS else "warn"
+                lat_sym = "✓" if perf_metrics.avg_latency_ms <= cfg.LATENCY_FAIR_MS else "⚠"
+                update_step(6, f"{perf_metrics.avg_latency_ms:.0f} ms", lat_sym, perf_metrics.latency_display, lat_tag,
+                            f"Step 7: Latency -> {perf_metrics.latency_display}")
+            else:
+                update_step(6, "N/A", "—", "Measurement unavailable", "muted", "Step 7: Latency -> Unavailable")
+
+            # Update Packet Loss Row (Step 8)
+            if perf_metrics.is_valid:
+                loss_tag = "pass" if perf_metrics.packet_loss_pct <= cfg.LOSS_FAIR_PCT else "warn"
+                loss_sym = "✓" if perf_metrics.packet_loss_pct <= cfg.LOSS_FAIR_PCT else "⚠"
+                update_step(7, f"{perf_metrics.packet_loss_pct:.0f}%", loss_sym, perf_metrics.loss_display, loss_tag,
+                            f"Step 8: Packet Loss -> {perf_metrics.loss_display}")
+            else:
+                update_step(7, "N/A", "—", "Measurement unavailable", "muted", "Step 8: Packet Loss -> Unavailable")
+
+            # ── Final Assembly & RCA Evaluation ──────────────────────
+            set_progress(95)
+            diag_result = collector.build_diagnostic_result(
+                adapter_res, ip_res, gw_res, wifi_info, dns_res, inet_res, perf_metrics
+            )
+            set_progress(100)
+
+            # ── Save to Database (Phase 3) ───────────────────────────
+            try:
+                session_id = db.save_diagnostic(diag_result)
+                db.log_event(
+                    "DIAGNOSTIC",
+                    f"Scan completed — Health: {diag_result.health.score}/100 "
+                    f"({diag_result.health.label}), RCA: {diag_result.rca.overall_status}",
+                    severity="INFO" if diag_result.health.score >= 70 else "WARNING",
+                )
+            except Exception as e:
+                db.log_event("ERROR", f"Failed to save diagnostic: {str(e)}", severity="CRITICAL")
+
+            # ── Degradation Detection (Phase 3) ──────────────────────
+            try:
+                degradation_alerts = db.detect_degradation(diag_result)
+                if degradation_alerts:
+                    for alert in degradation_alerts:
+                        db.log_event("DEGRADATION", alert, severity="WARNING")
+                    self._dispatch_ui(
+                        lambda: self._show_degradation_alerts(degradation_alerts)
+                    )
+            except Exception:
+                pass
+
+            # Finalize on UI thread
+            self._dispatch_ui(lambda: self._finalize_scan(diag_result))
+
+        except Exception as e:
+            self._dispatch_ui(lambda: self._handle_error(str(e)))
+
+    def _finalize_scan(self, result: DiagnosticResult):
+        """Update all views, reset buttons, and refresh sidebar footer."""
+        self.is_running = False
+        self.diagnostic_data = result
+        self.btn_run.config(state="normal", bg=cfg.COLOR_ACCENT)
+
+        # Status text
+        hlth = result.health
+        self.lbl_status.config(
+            text=f"Health: {hlth.score}/100 ({hlth.label}) — {result.rca.overall_status}",
+            fg=hlth.color,
+        )
+
+        # Push data to all 7 views
+        for page in self.pages.values():
+            try:
+                page.update_data(result)
+            except Exception:
+                pass
+
+        # Update sidebar footer
+        self.sidebar.update_status(
+            result.adapter.name,
+            is_running=False,
+            is_healthy=(hlth.score >= 70),
+        )
+
+        # Append final completion to console log
+        diag_view: DiagnosticsView = self.pages["diagnostics"]
+        diag_view.append_log(
+            f"Diagnostic scan completed successfully. Health Score: {hlth.score}/100 ({hlth.label})."
+        )
+
+    def _handle_error(self, err_msg: str):
+        """Handle worker errors safely on the main thread."""
+        self.is_running = False
+        self.btn_run.config(state="normal", bg=cfg.COLOR_ACCENT)
+        self.lbl_status.config(text=f"Error: {err_msg}", fg=cfg.COLOR_FAILURE)
+
+        diag_view: DiagnosticsView = self.pages["diagnostics"]
+        diag_view.append_log(f"ERROR: Diagnostic worker exception: {err_msg}")
+
+        db.log_event("ERROR", f"Diagnostic error: {err_msg}", severity="CRITICAL")
+
+    def _show_degradation_alerts(self, alerts: list):
+        """Show degradation alerts on the monitoring page."""
+        mon_view: MonitoringView = self.pages["monitoring"]
+        mon_view.show_alerts(alerts)
+        self._monitor_alert_count += len(alerts)
+        mon_view.update_alert_count(self._monitor_alert_count)
+
+    # ═══════════════════════════════════════════════════════════════
+    # BACKGROUND MONITORING ENGINE (Phase 3)
+    # ═══════════════════════════════════════════════════════════════
+
+    def _start_monitoring(self, interval_sec: int):
+        """Start the background monitoring thread."""
+        if self._monitor_active:
             return
 
-        d = self.diagnostic_data
-        diag = d["diagnosis"]
+        self._monitor_active = True
+        self._monitor_stop_event.clear()
+        self._monitor_scan_count = 0
+        self._monitor_alert_count = 0
 
-        report_content = f"""=================================================================
-AUTOMATED NETWORK DIAGNOSTIC & CONNECTIVITY ANALYSIS REPORT
-=================================================================
-Date/Time: {time.strftime('%Y-%m-%d %H:%M:%S')}
+        db.log_event("MONITORING", f"Background monitoring started (interval: {interval_sec}s)", severity="INFO")
 
-1. NETWORK ADAPTER CHECK:
-   Status  : {"✓ Connected" if d["adapter"][0] else "✗ Disconnected"}
-   Details : {d["adapter"][2]}
+        mon_view: MonitoringView = self.pages["monitoring"]
+        mon_view.append_event(f"Monitoring started — scanning every {interval_sec}s", "success")
 
-2. IP ADDRESS CHECK:
-   Status  : {"✓ Valid IP" if d["ip"][0] else "✗ Not Available"}
-   Address : {d["ip"][1]}
+        self._monitor_thread = threading.Thread(
+            target=self._monitoring_loop,
+            args=(interval_sec,),
+            daemon=True,
+        )
+        self._monitor_thread.start()
 
-3. DEFAULT GATEWAY CHECK:
-   Status  : {"✓ Reachable" if (d["gateway"][0] and d["gateway"][2]) else "✗ Unreachable / Not Available"}
-   Gateway : {d["gateway"][3]}
+    def _stop_monitoring(self):
+        """Signal the monitoring thread to stop."""
+        if not self._monitor_active:
+            return
 
-4. DNS RESOLUTION CHECK:
-   Status  : {"✓ Working" if d["dns"][0] else "✗ Failed"}
-   Details : {d["dns"][2]}
+        self._monitor_active = False
+        self._monitor_stop_event.set()
 
-5. INTERNET CONNECTIVITY CHECK:
-   Status  : {"✓ Connected" if d["internet"][0] else "✗ Unreachable"}
-   Details : {d["internet"][2]}
+        db.log_event("MONITORING", "Background monitoring stopped by user", severity="INFO")
 
-=================================================================
-SUMMARY & DIAGNOSIS
-=================================================================
-Overall Status : {diag["overall_status"]}
-Case Code      : {diag["case_code"]}
-Diagnosis      : {diag["diagnosis"]}
-Recommendation : {diag["recommendation"]}
-=================================================================
-"""
-        try:
-            with open(file_path, "w", encoding="utf-8") as f:
-                f.write(report_content)
-            messagebox.showinfo("Save Report", f"Report saved successfully to:\n{file_path}")
-        except Exception as e:
-            messagebox.showerror("Save Error", f"Failed to save report: {e}")
+        mon_view: MonitoringView = self.pages["monitoring"]
+        mon_view.append_event(
+            f"Monitoring stopped — {self._monitor_scan_count} scans completed, "
+            f"{self._monitor_alert_count} alerts",
+            "info",
+        )
 
+    def _monitoring_loop(self, interval_sec: int):
+        """
+        Background monitoring loop.
+        Runs collect_diagnostic() at the specified interval,
+        saves results, checks for degradation, and updates the UI.
+
+        The loop sleeps in 1-second increments to allow responsive stop.
+        """
+        while not self._monitor_stop_event.is_set():
+            # Countdown before next scan
+            for remaining in range(interval_sec, 0, -1):
+                if self._monitor_stop_event.is_set():
+                    return
+                self._dispatch_ui(
+                    lambda r=remaining: self.pages["monitoring"].update_next_scan(r)
+                )
+                time.sleep(1)
+
+            if self._monitor_stop_event.is_set():
+                return
+
+            # ── Run silent diagnostic ──────────────────────────────
+            try:
+                self._dispatch_ui(
+                    lambda: self.pages["monitoring"].append_event("Running background scan...", "info")
+                )
+
+                result = collector.collect_diagnostic()
+                self._monitor_scan_count += 1
+
+                # Save to database
+                db.save_diagnostic(result)
+                db.log_event(
+                    "MONITOR_SCAN",
+                    f"Monitor scan #{self._monitor_scan_count} — "
+                    f"Health: {result.health.score}/100, "
+                    f"Latency: {result.performance.avg_latency_ms:.0f}ms",
+                    severity="INFO" if result.health.score >= 70 else "WARNING",
+                )
+
+                # Degradation detection
+                alerts = db.detect_degradation(result)
+                if alerts:
+                    for alert in alerts:
+                        db.log_event("DEGRADATION", alert, severity="WARNING")
+
+                # Update UI from main thread
+                scan_num = self._monitor_scan_count
+                health_score = result.health.score
+                health_label = result.health.label
+
+                def _update_monitor_ui(
+                    _result=result, _alerts=alerts,
+                    _scan_num=scan_num, _health=health_score, _label=health_label
+                ):
+                    mon_view: MonitoringView = self.pages["monitoring"]
+                    mon_view.update_scan_count(_scan_num)
+                    mon_view.update_last_scan_time(
+                        _result.timestamp.strftime("%H:%M:%S")
+                    )
+                    mon_view.append_event(
+                        f"Scan #{_scan_num} complete — Health: {_health}/100 ({_label})",
+                        "success" if _health >= 70 else "warning",
+                    )
+
+                    if _alerts:
+                        mon_view.show_alerts(_alerts)
+                        self._monitor_alert_count += len(_alerts)
+                        mon_view.update_alert_count(self._monitor_alert_count)
+                        for a in _alerts:
+                            mon_view.append_event(f"DEGRADATION: {a}", "degradation")
+                    else:
+                        mon_view.show_alerts([])
+
+                    # Update main diagnostic data and all views
+                    self.diagnostic_data = _result
+                    for page in self.pages.values():
+                        try:
+                            page.update_data(_result)
+                        except Exception:
+                            pass
+
+                    # Update sidebar
+                    self.sidebar.update_status(
+                        _result.adapter.name,
+                        is_running=False,
+                        is_healthy=(_health >= 70),
+                    )
+
+                    # Update header status
+                    self.lbl_status.config(
+                        text=f"Monitor: {_health}/100 ({_label})",
+                        fg=_result.health.color,
+                    )
+
+                self._dispatch_ui(_update_monitor_ui)
+
+            except Exception as e:
+                err_msg = str(e)
+                self._dispatch_ui(
+                    lambda: self.pages["monitoring"].append_event(
+                        f"Monitor scan error: {err_msg}", "critical"
+                    )
+                )
+                db.log_event("ERROR", f"Monitor scan error: {err_msg}", severity="CRITICAL")
+
+
+# ═══════════════════════════════════════════════════════════════
+# APPLICATION ENTRY POINT
+# ═══════════════════════════════════════════════════════════════
 
 def main():
     root = tk.Tk()
-    app = NetworkDiagnosticApp(root)
+    app = IntelliNetApp(root)
     root.mainloop()
 
 
