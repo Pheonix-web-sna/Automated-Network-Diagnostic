@@ -14,6 +14,7 @@ import subprocess
 import socket
 import re
 import time
+import json
 import psutil
 import sys
 import os
@@ -160,6 +161,35 @@ def get_default_gateway():
         pass
 
     return None
+
+
+def get_dns_servers(adapter_name=None):
+    """Return DNS server addresses configured on the selected Windows adapter."""
+    if not adapter_name or sys.platform != "win32":
+        return []
+
+    # Interface names come from the local adapter inventory. Escape PowerShell's
+    # single-quoted string delimiter before embedding the value in this read-only query.
+    safe_name = str(adapter_name).replace("'", "''")
+    script = (
+        "$servers = Get-DnsClientServerAddress -AddressFamily IPv4 "
+        f"| Where-Object {{ $_.InterfaceAlias -eq '{safe_name}' }} "
+        "| Select-Object -ExpandProperty ServerAddresses; "
+        "ConvertTo-Json -InputObject @($servers) -Compress"
+    )
+    output = _run_cmd(
+        ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+        timeout=8,
+    )
+    try:
+        values = json.loads(output)
+    except (TypeError, ValueError):
+        return []
+    if values is None:
+        return []
+    if isinstance(values, str):
+        values = [values]
+    return [str(value) for value in values if value]
 
 
 def ping_host(host: str, timeout_sec: int = 2) -> bool:

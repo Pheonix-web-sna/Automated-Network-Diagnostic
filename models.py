@@ -59,6 +59,7 @@ class DNSInfo:
     domain_tested: str
     resolved_ip: str = ""
     display: str = ""
+    dns_servers: List[str] = field(default_factory=list)
 
 
 @dataclass

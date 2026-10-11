@@ -113,6 +113,7 @@ def build_diagnostic_result(
         is_working=dns_ok,
         domain_tested=cfg.DNS_TEST_DOMAIN,
         display=dns_det,
+        dns_servers=nd.get_dns_servers(adapter_name if adapter_ok else None),
     )
 
     internet = InternetInfo(
