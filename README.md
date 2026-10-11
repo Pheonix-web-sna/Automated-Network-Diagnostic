@@ -16,8 +16,8 @@ The objective of this project is to create an automated, offline-friendly networ
   1. **Network Adapter Check**: Detects active physical interfaces (Wi-Fi, Ethernet) using `psutil`.
   2. **IP Address Check**: Identifies assigned IPv4 address while ignoring loopback (`127.0.0.1`) and self-assigned APIPA (`169.254.x.x`).
   3. **Default Gateway Check**: Determines the local router gateway via `ipconfig` / routing table and tests reachability with ICMP ping.
-  4. **DNS Resolution Check**: Tests socket name resolution against `google.com`.
-  5. **Internet Connectivity Check**: Verifies raw internet IP routing by pinging `8.8.8.8` (independent of DNS).
+  4. **DNS Resolution Check**: Tests the configured DNS resolver against `google.com` with a bounded timeout.
+  5. **Internet Connectivity Check**: Tests public IP reachability with ICMP and a TCP fallback.
   6. **Data Synthesis**: Combines all 5 diagnostic vectors.
   7. **Rule-Based Diagnosis**: Evaluates state against pre-defined expert troubleshooting rules.
   8. **Recommendation Generation**: Displays direct user guidance for resolving the issue.
@@ -25,6 +25,7 @@ The objective of this project is to create an automated, offline-friendly networ
 - **Real-Time Progress Feedback**: Displays live progress bar and status steps during scanning.
 - **PDF Diagnostic Reports**: Exports an executive summary, network configuration, connectivity and performance results, root-cause analysis, confidence score, recommendations, and session actions performed.
 - **Safe Quick Remediation**: Flushes the DNS cache or renews the DHCP address only after explicit confirmation. Diagnostics can be re-run without changing network configuration.
+- **History and Monitoring**: Stores bounded diagnostic history in SQLite, charts health and network metrics, and checks background scans for degradation.
 - **Zero External Cloud Dependencies**: Works entirely locally without third-party APIs or database servers.
 
 ---
@@ -36,9 +37,11 @@ The objective of this project is to create an automated, offline-friendly networ
 | **Python 3.11+** | Core programming language |
 | **Tkinter** | Native desktop GUI framework |
 | **`psutil`** | Network interface status and IPv4 address inspection |
-| **`socket`** | Standard library module for DNS resolution testing |
+| **`socket`** | Standard library module for DNS and TCP connectivity checks |
 | **`subprocess`** | Windows command execution (`ipconfig`, `ping`, `route`) |
 | **`threading`** | Asynchronous execution to keep GUI active |
+| **SQLite** | Local diagnostic history and monitoring event storage |
+| **Matplotlib** | History charts embedded in the desktop UI |
 | **ReportLab** | Structured PDF report generation |
 
 ---
@@ -77,7 +80,13 @@ python main.py
 
 ## Automated Checks
 
-Run the report and remediation unit tests with: python -m unittest discover -s tests -v
+Run the complete unit suite with:
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+The suite covers diagnostic scenarios, DNS timeouts and failures, ping parsing, adapter-specific gateway selection, monitoring order, SQLite history, report generation, and confirmation-gated remediation.
 
 ---
 
@@ -143,6 +152,18 @@ To test and demonstrate the framework during project presentation:
    - **Recommendation**: Connect to Wi-Fi or Ethernet and retry.
 4. Re-enable Wi-Fi and click **RUN AGAIN** to verify recovery to Scenario 1.
 
+### Monitoring, History, and Report
+1. Run diagnostics on a normal connection and open **History** to see the saved session.
+2. Open **Monitoring**, start monitoring, and wait for the selected scan interval; each scan is saved and checked against prior history.
+3. Return to the completed scan and select **Export PDF** to save the report.
+4. To demonstrate DNS failure, no internet, high latency, or packet loss without changing the presentation computer's network settings, run the unit suite. Those conditions are covered with deterministic simulated probe outputs; the desktop app intentionally reads live network state.
+
+## Known Limitations
+- The desktop interface targets Windows 10/11 and uses Windows networking commands.
+- ICMP can be filtered by a router, host firewall, or ISP. The app reports ICMP loss separately from latency and uses a TCP fallback for internet reachability, but some networks may still block both probe types.
+- The app has no built-in simulation mode. Disconnected, DNS-failure, and degraded-performance states are covered by unit tests; reproducing them in the UI requires a controlled network environment.
+- History is stored locally in the current user's application data folder and is limited to the newest 500 diagnostic sessions.
+
 ---
 
 ## 📂 Project Structure
@@ -150,15 +171,21 @@ To test and demonstrate the framework during project presentation:
 ```
 Automated-Network-Diagnostic/
 │
-├── main.py                  # Tkinter GUI, diagnostics, PDF export, and remediation confirmations
-├── reporting.py             # Structured PDF diagnostic report generator
-├── remediation.py           # Confirmed DNS flush, IP renewal, and diagnostic rerun actions
-├── network_diagnostics.py   # Adapter, IP, gateway, DNS, connectivity, and Wi-Fi probes
-├── models.py                # Typed diagnostic and remediation data
-├── tests/                   # Report, network configuration, and remediation unit tests
-├── requirements.txt         # Required Python packages
-├── README.md                # Full project documentation & presentation guide
-└── screenshots/             # Interface preview screenshots
+├── main.py                  # Tkinter app, worker coordination, monitoring, and remediation confirmation
+├── config.py                # Probe targets, timeouts, scoring thresholds, and UI settings
+├── collector.py             # Shared diagnostic orchestration and result assembly
+├── network_diagnostics.py   # Adapter, IP, gateway, DNS, internet, Wi-Fi, and traffic probes
+├── performance.py           # Ping execution and latency / packet-loss parsing
+├── rca_engine.py            # Health scoring and root-cause analysis
+├── recommendations.py       # Remediation recommendations
+├── remediation.py           # Confirmation-gated DNS flush and DHCP renewal
+├── reporting.py             # Executive summary and PDF report generation
+├── db_manager.py            # SQLite schema, history, retention, and degradation checks
+├── models.py                # Diagnostic and action data models
+├── *_view.py                # Dashboard, diagnostic, performance, history, and monitoring UI pages
+├── tests/                   # Diagnostic, monitoring, history, report, and remediation tests
+├── requirements.txt         # psutil, matplotlib, and reportlab
+└── README.md                # Setup, workflow, limitations, and demo instructions
 ```
 
 ---

@@ -21,8 +21,8 @@ class DiagnosticsView(tk.Frame):
         ("02", "IPv4 Address", "Checks valid IP assignment and detects APIPA/self-assigned ranges"),
         ("03", "Default Gateway", "Checks gateway route and ICMP ping response from local router"),
         ("04", "Wi-Fi / Link Info", "Queries netsh wlan for SSID, BSSID, Signal %, channel and rates"),
-        ("05", "DNS Resolution", "Tests socket getaddrinfo resolution against public domain"),
-        ("06", "Internet Connectivity", "Tests direct ICMP/TCP connectivity to public IP 8.8.8.8"),
+        ("05", "DNS Resolution", "Tests the configured DNS resolver with a bounded lookup"),
+        ("06", "Internet Connectivity", "Tests public network reachability using ICMP and TCP fallback"),
         ("07", "Latency & Jitter", "Measures average, min, max round-trip time and jitter"),
         ("08", "Packet Loss", "Calculates packet loss percentage across multi-ping sequence"),
     ]
@@ -248,10 +248,14 @@ class DiagnosticsView(tk.Frame):
         self.console.config(state="normal")
         self.console.insert("end", line)
         self.console.see("end")
+        line_count = max(0, int(self.console.index("end-1c").split(".")[0]) - 1)
+        excess = line_count - cfg.MAX_DIAGNOSTIC_LOG_LINES
+        if excess > 0:
+            self.console.delete("1.0", f"{excess + 1}.0")
         self.console.config(state="disabled")
 
         # Update event counter
-        lines = int(self.console.index("end-1c").split(".")[0])
+        lines = max(0, int(self.console.index("end-1c").split(".")[0]) - 1)
         self.log_count.config(text=f"{lines} events recorded")
 
     def update_data(self, result: DiagnosticResult):

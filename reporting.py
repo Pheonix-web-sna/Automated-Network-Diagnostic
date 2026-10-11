@@ -7,7 +7,7 @@ from typing import Iterable, Mapping
 import os
 
 from reportlab.lib import colors
-from reportlab.lib.enums import TA_CENTER, TA_LEFT
+from reportlab.lib.enums import TA_LEFT
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import mm
@@ -80,6 +80,14 @@ def build_report_sections(
             ("Packet loss", f"{performance.packet_loss_pct:.1f}%"),
             ("Probe count", str(performance.ping_count)),
             ("Quality rating", performance.latency_rating),
+        ]
+    elif performance.has_packet_measurement:
+        performance_rows = [
+            ("Measurement target", _display(performance.target_host)),
+            ("Latency", "Unavailable — no ICMP echo replies received"),
+            ("Packet loss", f"{performance.packet_loss_pct:.1f}%"),
+            ("Probe count", str(performance.ping_count)),
+            ("Details", _display(performance.error)),
         ]
     else:
         performance_rows = [

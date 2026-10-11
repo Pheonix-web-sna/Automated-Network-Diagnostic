@@ -10,7 +10,7 @@ Architecture:
   - Background monitoring thread with configurable scan interval.
   - SQLite persistent storage for diagnostic history, metrics, and events.
   - Automatic network degradation detection with alert system.
-  - Zero hardcoding — all data is retrieved live from the local network stack.
+  - Probe targets, thresholds, and UI settings are centralized in config.py.
 """
 
 import tkinter as tk
@@ -18,6 +18,7 @@ from tkinter import ttk, messagebox, filedialog
 import threading
 import queue
 import time
+import logging
 import sys
 import os
 from datetime import datetime
@@ -26,11 +27,9 @@ from datetime import datetime
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import config as cfg
-import network_diagnostics as nd
-import performance as perf
 import collector
 import db_manager as db
-from models import PerformanceMetrics, WiFiInfo, DiagnosticResult
+from models import DiagnosticResult
 from reporting import generate_pdf_report
 from remediation import (
     ACTION_LABELS,
@@ -68,6 +67,15 @@ class IntelliNetApp:
     }
 
     def __init__(self, root: tk.Tk):
+        try:
+            db.init_db()
+        except Exception:
+            logging.exception("Could not initialize diagnostic history database")
+            messagebox.showwarning(
+                "History storage unavailable",
+                "IntelliNet can still run live diagnostics and create reports, but history and monitoring events may not be saved.",
+                parent=root,
+            )
         self.root = root
         self.root.title(f"{cfg.APP_NAME} — {cfg.APP_SUBTITLE}")
         self.root.geometry(f"{cfg.WINDOW_WIDTH}x{cfg.WINDOW_HEIGHT}")
@@ -93,7 +101,7 @@ class IntelliNetApp:
         self._poll_ui_queue()
 
         # Log application startup
-        db.log_event("SYSTEM", "IntelliNet application started", severity="INFO")
+        self._safe_log_event("SYSTEM", "IntelliNet application started", severity="INFO")
 
         # Trigger automatic initial network scan on launch
         self.root.after(300, self.start_diagnostic)
@@ -306,7 +314,7 @@ class IntelliNetApp:
                 try:
                     fn()
                 except Exception:
-                    pass
+                    logging.exception("A queued UI update failed")
         except queue.Empty:
             pass
         self.root.after(40, self._poll_ui_queue)
@@ -351,165 +359,45 @@ class IntelliNetApp:
         try:
             diag_view: DiagnosticsView = self.pages["diagnostics"]
 
-            def update_step(step_idx, status_text, sym, details, tag, log_msg):
-                self._dispatch_ui(lambda: diag_view.set_row_result(step_idx, sym, details, tag))
-                self._dispatch_ui(lambda: diag_view.append_log(log_msg))
-
-            def set_status(text, col=cfg.COLOR_TEXT_PRIMARY):
-                self._dispatch_ui(lambda: self.lbl_status.config(text=text, fg=col))
-
-            def set_progress(val):
-                self._dispatch_ui(lambda: self.progress_bar.config(value=val))
-
-            # ── Step 1: Network Adapter ──────────────────────────────
-            set_status("Detecting network adapter...", cfg.COLOR_ACCENT)
-            set_progress(10)
-            self._dispatch_ui(lambda: diag_view.set_row_testing(0))
-            time.sleep(0.15)
-
-            adapter_res = nd.get_active_adapter()
-            a_ok, a_name, a_det = adapter_res
-            sym = "✓" if a_ok else "✗"
-            tag = "pass" if a_ok else "fail"
-            update_step(0, "Active" if a_ok else "Failed", sym, a_det, tag,
-                        f"Step 1: Network Adapter -> {a_name} ({'UP' if a_ok else 'DOWN'})")
-
-            # ── Step 2: IPv4 Address ─────────────────────────────────
-            set_status("Detecting IPv4 configuration...", cfg.COLOR_ACCENT)
-            set_progress(24)
-            self._dispatch_ui(lambda: diag_view.set_row_testing(1))
-            time.sleep(0.15)
-
-            ip_res = nd.get_ipv4_address(a_name if a_ok else None)
-            ip_ok, ip_addr, ip_det = ip_res
-            sym = "✓" if ip_ok else "✗"
-            tag = "pass" if ip_ok else "fail"
-            update_step(1, "Assigned" if ip_ok else "Failed", sym, ip_det, tag,
-                        f"Step 2: IPv4 Address -> {ip_addr}")
-
-            # ── Step 3: Default Gateway ──────────────────────────────
-            set_status("Checking default gateway reachability...", cfg.COLOR_ACCENT)
-            set_progress(38)
-            self._dispatch_ui(lambda: diag_view.set_row_testing(2))
-            time.sleep(0.15)
-
-            gw_res = nd.check_gateway()
-            gw_has, gw_ip, gw_reach, gw_disp = gw_res
-            gw_ok = gw_has and gw_reach
-            sym = "✓" if gw_ok else "✗"
-            tag = "pass" if gw_ok else ("warn" if gw_has else "fail")
-            update_step(2, "Reachable" if gw_ok else "Unreachable", sym, gw_disp, tag,
-                        f"Step 3: Default Gateway -> {gw_ip} ({'Reachable' if gw_reach else 'Unreachable'})")
-
-            # ── Step 4: Wi-Fi Parameters ─────────────────────────────
-            set_status("Querying Wi-Fi & physical link parameters...", cfg.COLOR_ACCENT)
-            set_progress(50)
-            self._dispatch_ui(lambda: diag_view.set_row_testing(3))
-            time.sleep(0.15)
-
-            wifi_info: WiFiInfo = nd.get_wifi_info()
-            w_sym = "✓" if wifi_info.is_wifi else "ℹ"
-            w_tag = "pass" if wifi_info.is_wifi else "info"
-            w_det = wifi_info.display if wifi_info.display else ("Connected" if a_ok else "No Link")
-            update_step(3, "Connected", w_sym, w_det, w_tag,
-                        f"Step 4: Wi-Fi / Link -> {w_det}")
-
-            # ── Step 5: DNS Resolution ───────────────────────────────
-            set_status(f"Resolving DNS ({cfg.DNS_TEST_DOMAIN})...", cfg.COLOR_ACCENT)
-            set_progress(64)
-            self._dispatch_ui(lambda: diag_view.set_row_testing(4))
-            time.sleep(0.15)
-
-            dns_res = nd.check_dns(cfg.DNS_TEST_DOMAIN)
-            dns_ok, dns_status, dns_det = dns_res
-            sym = "✓" if dns_ok else "✗"
-            tag = "pass" if dns_ok else "fail"
-            update_step(4, dns_status, sym, dns_det, tag,
-                        f"Step 5: DNS Resolution -> {dns_det}")
-
-            # ── Step 6: Internet Connectivity ────────────────────────
-            set_status(f"Testing WAN internet connectivity ({cfg.PING_TARGET_PRIMARY})...", cfg.COLOR_ACCENT)
-            set_progress(76)
-            self._dispatch_ui(lambda: diag_view.set_row_testing(5))
-            time.sleep(0.15)
-
-            inet_res = nd.check_internet(cfg.PING_TARGET_PRIMARY)
-            inet_ok, inet_status, inet_det = inet_res
-            sym = "✓" if inet_ok else "✗"
-            tag = "pass" if inet_ok else "fail"
-            update_step(5, inet_status, sym, inet_det, tag,
-                        f"Step 6: Internet Access -> {inet_det}")
-
-            # ── Step 7 & 8: Performance Measurement ──────────────────
-            set_status("Measuring latency & packet loss (4 ICMP pings)...", cfg.COLOR_TEAL)
-            set_progress(88)
-            self._dispatch_ui(lambda: diag_view.set_row_testing(6))
-            self._dispatch_ui(lambda: diag_view.set_row_testing(7))
-
-            target = cfg.PING_TARGET_PRIMARY if inet_ok else (gw_ip if gw_reach else "")
-            if target:
-                perf_metrics = perf.measure_performance(target, cfg.PING_COUNT, cfg.PING_TIMEOUT_MS)
-            else:
-                perf_metrics = PerformanceMetrics(
-                    avg_latency_ms=-1, min_latency_ms=-1, max_latency_ms=-1,
-                    jitter_ms=-1, packet_loss_pct=100.0, ping_count=0,
-                    target_host="", error="No reachable host for performance test"
-                )
-
-            # Update Latency Row (Step 7)
-            if perf_metrics.is_valid:
-                lat_tag = "pass" if perf_metrics.avg_latency_ms <= cfg.LATENCY_FAIR_MS else "warn"
-                lat_sym = "✓" if perf_metrics.avg_latency_ms <= cfg.LATENCY_FAIR_MS else "⚠"
-                update_step(6, f"{perf_metrics.avg_latency_ms:.0f} ms", lat_sym, perf_metrics.latency_display, lat_tag,
-                            f"Step 7: Latency -> {perf_metrics.latency_display}")
-            else:
-                update_step(6, "N/A", "—", "Measurement unavailable", "muted", "Step 7: Latency -> Unavailable")
-
-            # Update Packet Loss Row (Step 8)
-            if perf_metrics.is_valid:
-                loss_tag = "pass" if perf_metrics.packet_loss_pct <= cfg.LOSS_FAIR_PCT else "warn"
-                loss_sym = "✓" if perf_metrics.packet_loss_pct <= cfg.LOSS_FAIR_PCT else "⚠"
-                update_step(7, f"{perf_metrics.packet_loss_pct:.0f}%", loss_sym, perf_metrics.loss_display, loss_tag,
-                            f"Step 8: Packet Loss -> {perf_metrics.loss_display}")
-            else:
-                update_step(7, "N/A", "—", "Measurement unavailable", "muted", "Step 8: Packet Loss -> Unavailable")
-
-            # ── Final Assembly & RCA Evaluation ──────────────────────
-            set_progress(95)
-            diag_result = collector.build_diagnostic_result(
-                adapter_res, ip_res, gw_res, wifi_info, dns_res, inet_res, perf_metrics
-            )
-            set_progress(100)
-
-            # ── Save to Database (Phase 3) ───────────────────────────
-            try:
-                session_id = db.save_diagnostic(diag_result)
-                db.log_event(
-                    "DIAGNOSTIC",
-                    f"Scan completed — Health: {diag_result.health.score}/100 "
-                    f"({diag_result.health.label}), RCA: {diag_result.rca.overall_status}",
-                    severity="INFO" if diag_result.health.score >= 70 else "WARNING",
-                )
-            except Exception as e:
-                db.log_event("ERROR", f"Failed to save diagnostic: {str(e)}", severity="CRITICAL")
-
-            # ── Degradation Detection (Phase 3) ──────────────────────
-            try:
-                degradation_alerts = db.detect_degradation(diag_result)
-                if degradation_alerts:
-                    for alert in degradation_alerts:
-                        db.log_event("DEGRADATION", alert, severity="WARNING")
-                    self._dispatch_ui(
-                        lambda: self._show_degradation_alerts(degradation_alerts)
+            def report_progress(row, headline, status, symbol, details, tag, message, percent):
+                def update_row():
+                    if row is not None:
+                        diag_view.set_row_testing(row)
+                        diag_view.set_row_result(row, symbol, details, tag)
+                    if message:
+                        diag_view.append_log(message)
+                    self.lbl_status.config(
+                        text=headline,
+                        fg=cfg.COLOR_TEAL if row in (6, 7) else cfg.COLOR_ACCENT,
                     )
+                    self.progress_bar.config(value=percent)
+                self._dispatch_ui(update_row)
+
+            result = collector.collect_diagnostic(progress_callback=report_progress)
+            try:
+                degradation_alerts = db.detect_degradation(result)
             except Exception:
-                pass
-
-            # Finalize on UI thread
-            self._dispatch_ui(lambda: self._finalize_scan(diag_result))
-
-        except Exception as e:
-            self._dispatch_ui(lambda: self._handle_error(str(e)))
+                logging.exception("Could not check diagnostic degradation")
+                degradation_alerts = []
+            try:
+                db.save_diagnostic(result)
+                self._safe_log_event(
+                    "DIAGNOSTIC",
+                    f"Scan completed — Health: {result.health.score}/100 "
+                    f"({result.health.label}), RCA: {result.rca.overall_status}",
+                    severity="INFO" if result.health.score >= 70 else "WARNING",
+                )
+            except Exception:
+                logging.exception("Could not save diagnostic history")
+            for alert in degradation_alerts:
+                self._safe_log_event("DEGRADATION", alert, severity="WARNING")
+            if degradation_alerts:
+                self._dispatch_ui(lambda alerts=degradation_alerts: self._show_degradation_alerts(alerts))
+            self._dispatch_ui(lambda result=result: self._finalize_scan(result))
+        except Exception as exc:
+            logging.exception("Diagnostic worker failed")
+            error_message = str(exc)
+            self._dispatch_ui(lambda message=error_message: self._handle_error(message))
 
     def _finalize_scan(self, result: DiagnosticResult):
         """Update all views, reset buttons, and refresh sidebar footer."""
@@ -531,12 +419,14 @@ class IntelliNetApp:
             fg=hlth.color,
         )
 
-        # Push data to all 7 views
-        for page in self.pages.values():
+        # Refresh the visible view. Other views sync when opened, avoiding
+        # hidden chart redraws and history database reads on every scan.
+        page = self.pages.get(self.current_page)
+        if page:
             try:
                 page.update_data(result)
             except Exception:
-                pass
+                logging.exception("The visible view failed to refresh after a diagnostic")
 
         # Update sidebar footer
         self.sidebar.update_status(
@@ -566,7 +456,14 @@ class IntelliNetApp:
         diag_view: DiagnosticsView = self.pages["diagnostics"]
         diag_view.append_log(f"ERROR: Diagnostic worker exception: {err_msg}")
 
-        db.log_event("ERROR", f"Diagnostic error: {err_msg}", severity="CRITICAL")
+        self._safe_log_event("ERROR", f"Diagnostic error: {err_msg}", severity="CRITICAL")
+
+    @staticmethod
+    def _safe_log_event(event_type: str, message: str, severity: str = "INFO", details: str = ""):
+        try:
+            db.log_event(event_type, message, severity=severity, details=details)
+        except Exception:
+            logging.exception("Could not write event log entry: %s", event_type)
 
     def export_report(self):
         """Save the latest completed diagnostic and session actions as a PDF."""
@@ -743,12 +640,17 @@ class IntelliNetApp:
         if self._monitor_active:
             return
 
+        interval_sec = max(
+            cfg.MONITOR_MIN_INTERVAL_SEC,
+            min(int(interval_sec), cfg.MONITOR_MAX_INTERVAL_SEC),
+        )
+
         self._monitor_active = True
         self._monitor_stop_event.clear()
         self._monitor_scan_count = 0
         self._monitor_alert_count = 0
 
-        db.log_event("MONITORING", f"Background monitoring started (interval: {interval_sec}s)", severity="INFO")
+        self._safe_log_event("MONITORING", f"Background monitoring started (interval: {interval_sec}s)", severity="INFO")
 
         mon_view: MonitoringView = self.pages["monitoring"]
         mon_view.append_event(f"Monitoring started — scanning every {interval_sec}s", "success")
@@ -768,7 +670,7 @@ class IntelliNetApp:
         self._monitor_active = False
         self._monitor_stop_event.set()
 
-        db.log_event("MONITORING", "Background monitoring stopped by user", severity="INFO")
+        self._safe_log_event("MONITORING", "Background monitoring stopped by user", severity="INFO")
 
         mon_view: MonitoringView = self.pages["monitoring"]
         mon_view.append_event(
@@ -807,21 +709,29 @@ class IntelliNetApp:
                 result = collector.collect_diagnostic()
                 self._monitor_scan_count += 1
 
-                # Save to database
-                db.save_diagnostic(result)
-                db.log_event(
-                    "MONITOR_SCAN",
-                    f"Monitor scan #{self._monitor_scan_count} — "
-                    f"Health: {result.health.score}/100, "
-                    f"Latency: {result.performance.avg_latency_ms:.0f}ms",
-                    severity="INFO" if result.health.score >= 70 else "WARNING",
-                )
-
                 # Degradation detection
-                alerts = db.detect_degradation(result)
+                try:
+                    alerts = db.detect_degradation(result)
+                except Exception:
+                    logging.exception("Could not check monitoring degradation")
+                    alerts = []
+
+                # Save after comparison so this scan does not become its own baseline.
+                try:
+                    db.save_diagnostic(result)
+                    self._safe_log_event(
+                        "MONITOR_SCAN",
+                        f"Monitor scan #{self._monitor_scan_count} — "
+                        f"Health: {result.health.score}/100, "
+                        f"Latency: {result.performance.avg_latency_ms:.0f}ms",
+                        severity="INFO" if result.health.score >= 70 else "WARNING",
+                    )
+                except Exception:
+                    logging.exception("Could not save monitoring scan")
+
                 if alerts:
                     for alert in alerts:
-                        db.log_event("DEGRADATION", alert, severity="WARNING")
+                        self._safe_log_event("DEGRADATION", alert, severity="WARNING")
 
                 # Update UI from main thread
                 scan_num = self._monitor_scan_count
@@ -853,11 +763,12 @@ class IntelliNetApp:
 
                     # Update main diagnostic data and all views
                     self.diagnostic_data = _result
-                    for page in self.pages.values():
+                    page = self.pages.get(self.current_page)
+                    if page:
                         try:
                             page.update_data(_result)
                         except Exception:
-                            pass
+                            logging.exception("The visible view failed to refresh after a monitoring scan")
 
                     # Update sidebar
                     self.sidebar.update_status(
@@ -874,14 +785,15 @@ class IntelliNetApp:
 
                 self._dispatch_ui(_update_monitor_ui)
 
-            except Exception as e:
-                err_msg = str(e)
+            except Exception as exc:
+                logging.exception("Monitoring scan failed")
+                err_msg = str(exc)
                 self._dispatch_ui(
-                    lambda: self.pages["monitoring"].append_event(
-                        f"Monitor scan error: {err_msg}", "critical"
+                    lambda message=err_msg: self.pages["monitoring"].append_event(
+                        f"Monitor scan error: {message}", "critical"
                     )
                 )
-                db.log_event("ERROR", f"Monitor scan error: {err_msg}", severity="CRITICAL")
+                self._safe_log_event("ERROR", f"Monitor scan error: {err_msg}", severity="CRITICAL")
 
 
 # ═══════════════════════════════════════════════════════════════

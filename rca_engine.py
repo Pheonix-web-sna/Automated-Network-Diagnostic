@@ -95,7 +95,7 @@ def calculate_health_score(result: DiagnosticResult) -> HealthScore:
 
     # ── Graduated: Packet Loss ─────────────────────────────────────────────
     loss = result.performance.packet_loss_pct
-    if result.performance.avg_latency_ms < 0:
+    if not result.performance.has_packet_measurement:
         components["packet_loss"] = 0   # Measurement unavailable
     elif loss <= cfg.LOSS_EXCELLENT_PCT:
         components["packet_loss"] = w["packet_loss"]             # 5 pts
@@ -116,14 +116,7 @@ def calculate_health_score(result: DiagnosticResult) -> HealthScore:
 # CONFIDENCE SCORE ENGINE
 # ═══════════════════════════════════════════════════════════════
 
-def _confidence(
-    adapter_ok: bool,
-    ip_ok: bool,
-    gw_ok: bool,
-    dns_ok: bool,
-    inet_ok: bool,
-    case_code: str,
-) -> int:
+def _confidence(case_code: str) -> int:
     """
     Calculate diagnostic confidence (0-100).
 
@@ -214,7 +207,7 @@ def analyze(result: DiagnosticResult) -> RCAResult:
             case_code="CASE_1",
             primary_cause="Network adapter is disconnected or disabled.",
             secondary_causes=["All connectivity layers are unavailable without an active adapter."],
-            confidence=_confidence(a_ok, ip_ok, gw_ok, dns_ok, inet_ok, "CASE_1"),
+            confidence=_confidence("CASE_1"),
             overall_status="CRITICAL - ADAPTER DISCONNECTED",
             severity="CRITICAL",
         )
@@ -228,7 +221,7 @@ def analyze(result: DiagnosticResult) -> RCAResult:
             case_code="CASE_2",
             primary_cause="No valid IPv4 address has been assigned to the active adapter.",
             secondary_causes=secondary,
-            confidence=_confidence(a_ok, ip_ok, gw_ok, dns_ok, inet_ok, "CASE_2"),
+            confidence=_confidence("CASE_2"),
             overall_status="CRITICAL - NO IP ASSIGNED",
             severity="CRITICAL",
         )
@@ -244,7 +237,7 @@ def analyze(result: DiagnosticResult) -> RCAResult:
             case_code="CASE_3",
             primary_cause="Local network gateway is unreachable.",
             secondary_causes=secondary,
-            confidence=_confidence(a_ok, ip_ok, gw_ok, dns_ok, inet_ok, "CASE_3"),
+            confidence=_confidence("CASE_3"),
             overall_status="WARNING - GATEWAY UNREACHABLE",
             severity="WARNING",
         )
@@ -260,7 +253,7 @@ def analyze(result: DiagnosticResult) -> RCAResult:
             case_code="CASE_4",
             primary_cause="DNS name resolution is failing. Internet routing itself is functional.",
             secondary_causes=secondary,
-            confidence=_confidence(a_ok, ip_ok, gw_ok, dns_ok, inet_ok, "CASE_4"),
+            confidence=_confidence("CASE_4"),
             overall_status="WARNING - DNS RESOLUTION FAILURE",
             severity="WARNING",
         )
@@ -274,7 +267,7 @@ def analyze(result: DiagnosticResult) -> RCAResult:
             case_code="CASE_5",
             primary_cause="Internet connectivity is unreachable despite functional local gateway and DNS.",
             secondary_causes=secondary,
-            confidence=_confidence(a_ok, ip_ok, gw_ok, dns_ok, inet_ok, "CASE_5"),
+            confidence=_confidence("CASE_5"),
             overall_status="WARNING - INTERNET UNREACHABLE",
             severity="WARNING",
         )
@@ -288,7 +281,7 @@ def analyze(result: DiagnosticResult) -> RCAResult:
             case_code="CASE_HYBRID",
             primary_cause="Local gateway is reachable, but all WAN Internet access (DNS and IP) is unavailable.",
             secondary_causes=secondary,
-            confidence=_confidence(a_ok, ip_ok, gw_ok, dns_ok, inet_ok, "CASE_HYBRID"),
+            confidence=_confidence("CASE_HYBRID"),
             overall_status="WARNING - WAN INTERNET DOWN",
             severity="WARNING",
         )
@@ -296,23 +289,34 @@ def analyze(result: DiagnosticResult) -> RCAResult:
     # ── CASE 6: All connectivity layers pass ───────────────────────────────
     if gw_ok and dns_ok and inet_ok:
         # Check for performance degradation even though connected
-        if perf.is_valid:
-            has_latency_issue  = perf.avg_latency_ms > cfg.LATENCY_FAIR_MS
-            has_loss_issue     = perf.packet_loss_pct > cfg.LOSS_FAIR_PCT
+        if perf.is_valid or perf.has_packet_measurement:
+            has_latency_issue = perf.is_valid and perf.avg_latency_ms > cfg.LATENCY_FAIR_MS
+            has_loss_issue = (
+                perf.has_packet_measurement
+                and perf.packet_loss_pct > cfg.LOSS_FAIR_PCT
+            )
 
             if has_latency_issue or has_loss_issue:
                 secondary = []
                 if has_latency_issue:
                     secondary.append(f"High average latency: {perf.avg_latency_ms:.0f}ms (threshold: {cfg.LATENCY_FAIR_MS}ms).")
                 if has_loss_issue:
-                    secondary.append(f"Elevated packet loss: {perf.packet_loss_pct:.0f}% (threshold: {cfg.LOSS_FAIR_PCT}%).")
+                    if perf.packet_loss_pct >= 100:
+                        secondary.append(
+                            "No ICMP echo replies were received; the target may filter ICMP."
+                        )
+                    else:
+                        secondary.append(
+                            f"Elevated ICMP packet loss: {perf.packet_loss_pct:.0f}% "
+                            f"(threshold: {cfg.LOSS_FAIR_PCT}%)."
+                        )
                 secondary.append("Possible causes: network congestion, Wi-Fi interference, or ISP throttling.")
 
                 return RCAResult(
                     case_code="CASE_PERF",
                     primary_cause="Connected but experiencing degraded network performance.",
                     secondary_causes=secondary,
-                    confidence=_confidence(a_ok, ip_ok, gw_ok, dns_ok, inet_ok, "CASE_PERF"),
+                    confidence=_confidence("CASE_PERF"),
                     overall_status="PERFORMANCE - DEGRADED QUALITY",
                     severity="PERFORMANCE",
                 )
@@ -322,7 +326,7 @@ def analyze(result: DiagnosticResult) -> RCAResult:
             case_code="CASE_6",
             primary_cause="Network connection is functioning normally across all diagnostic layers.",
             secondary_causes=[],
-            confidence=_confidence(a_ok, ip_ok, gw_ok, dns_ok, inet_ok, "CASE_6"),
+            confidence=_confidence("CASE_6"),
             overall_status="NORMAL - FULLY OPERATIONAL",
             severity="NORMAL",
         )

@@ -2,12 +2,13 @@
 collector.py — IntelliNet Data Collection Orchestrator
 
 Assembles a complete DiagnosticResult from all probe modules.
-Called by main.py after each individual check completes (for live UI updates).
-Also provides build_diagnostic_result() to assemble from pre-collected tuples.
+Called by the GUI and monitoring worker for one shared diagnostic sequence.
+Also provides build_diagnostic_result() for typed result assembly.
 """
 
 import sys
 import os
+import re
 from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -24,6 +25,17 @@ import rca_engine
 import recommendations as rec_engine
 
 
+def _internet_probe_target(details: str):
+    """Extract the host that actually answered the reachability probe."""
+    icmp_match = re.search(r"ICMP reachable \(([^)]+)\)", details, re.IGNORECASE)
+    if icmp_match:
+        return icmp_match.group(1), "ICMP"
+    tcp_match = re.search(r"TCP connected \(([^:()]+):\d+\)", details, re.IGNORECASE)
+    if tcp_match:
+        return tcp_match.group(1), "TCP"
+    return cfg.PING_TARGET_PRIMARY, ""
+
+
 def build_diagnostic_result(
     adapter_tuple:  tuple,
     ip_tuple:       tuple,
@@ -36,8 +48,7 @@ def build_diagnostic_result(
     """
     Convert raw probe tuples + WiFiInfo + PerformanceMetrics into a DiagnosticResult.
 
-    This is called from main.py AFTER all individual live-update steps are done,
-    so the user has already seen each row update in real time.
+    Used by collect_diagnostic() after it has emitted the individual live steps.
 
     Args:
         adapter_tuple  : (is_up: bool, name: str, display: str)
@@ -109,21 +120,25 @@ def build_diagnostic_result(
         display=gw_disp,
     )
 
+    resolved_match = re.search(r"\bResolved\b.*?->\s*([0-9.]+)", dns_det, re.IGNORECASE)
     dns = DNSInfo(
         is_working=dns_ok,
         domain_tested=cfg.DNS_TEST_DOMAIN,
+        resolved_ip=resolved_match.group(1) if resolved_match else "",
         display=dns_det,
         dns_servers=nd.get_dns_servers(adapter_name if adapter_ok else None),
     )
 
+    internet_target, internet_method = _internet_probe_target(inet_det)
     internet = InternetInfo(
         is_connected=inet_ok,
-        target_ip=cfg.PING_TARGET_PRIMARY,
+        target_ip=internet_target,
+        method=internet_method,
         display=inet_det,
     )
 
     # Interface stats counters
-    iface_stats = nd.get_interface_stats(adapter_name if adapter_ok else None)
+    iface_stats = nd.get_interface_stats(adapter_name) if adapter_ok else {}
 
     # ── Temporary DiagnosticResult for engine input ────────────────────────
     # health/rca/recommendation are placeholders; computed below
@@ -161,40 +176,130 @@ def build_diagnostic_result(
     return result
 
 
-def collect_diagnostic() -> DiagnosticResult:
+def collect_diagnostic(progress_callback=None) -> DiagnosticResult:
     """
-    Full single-call collection: runs all probes sequentially and returns
-    a complete DiagnosticResult.
+    Run the shared diagnostic sequence and return a complete result.
 
-    Note: main.py uses the individual probe functions directly for live row updates.
-    This function is provided for CLI use or future API integration.
+    The optional callback receives:
+      (row, headline, status, symbol, details, tag, log_message, percent)
     """
-    adapter_tuple  = nd.get_active_adapter()
-    ip_tuple       = nd.get_ipv4_address(adapter_tuple[1] if adapter_tuple[0] else None)
-    gateway_tuple  = nd.check_gateway()
-    wifi_info      = nd.get_wifi_info()
-    dns_tuple      = nd.check_dns(cfg.DNS_TEST_DOMAIN)
+    def emit(row, headline, status, symbol, details, tag, message, percent):
+        if progress_callback:
+            progress_callback(row, headline, status, symbol, details, tag, message, percent)
+
+    adapter_tuple = nd.get_active_adapter()
+    adapter_ok, adapter_name, adapter_details = adapter_tuple
+    emit(
+        0, "Detecting network adapter...", "Active" if adapter_ok else "Failed",
+        "✓" if adapter_ok else "✗", adapter_details,
+        "pass" if adapter_ok else "fail",
+        f"Step 1: Network Adapter -> {adapter_name} ({'UP' if adapter_ok else 'DOWN'})",
+        10,
+    )
+
+    ip_tuple = (
+        nd.get_ipv4_address(adapter_name)
+        if adapter_ok
+        else (False, "Not Available", "No active adapter")
+    )
+    ip_ok, ip_addr, ip_details = ip_tuple
+    emit(
+        1, "Detecting IPv4 configuration...", "Assigned" if ip_ok else "Failed",
+        "✓" if ip_ok else "✗", ip_details,
+        "pass" if ip_ok else "fail", f"Step 2: IPv4 Address -> {ip_addr}", 24,
+    )
+
+    gateway_tuple = nd.check_gateway(adapter_name if adapter_ok else None)
+    gw_has, gw_ip, gw_reachable, gw_details = gateway_tuple
+    emit(
+        2, "Checking default gateway reachability...",
+        "Reachable" if gw_has and gw_reachable else "Unreachable",
+        "✓" if gw_has and gw_reachable else "✗", gw_details,
+        "pass" if gw_has and gw_reachable else ("warn" if gw_has else "fail"),
+        f"Step 3: Default Gateway -> {gw_ip} ({'Reachable' if gw_reachable else 'Unreachable'})",
+        38,
+    )
+
+    wifi_info = nd.get_wifi_info()
+    if wifi_info.is_wifi:
+        wifi_status, wifi_symbol, wifi_tag = "Connected", "✓", "pass"
+    elif adapter_ok and "ethernet" in adapter_name.lower():
+        wifi_status, wifi_symbol, wifi_tag = "Wired", "ℹ", "info"
+    else:
+        wifi_status, wifi_symbol, wifi_tag = "Unavailable", "—", "muted"
+    emit(
+        3, "Querying Wi-Fi and physical link parameters...", wifi_status,
+        wifi_symbol, wifi_info.display or wifi_status, wifi_tag,
+        f"Step 4: Wi-Fi / Link -> {wifi_info.display or wifi_status}", 50,
+    )
+
+    dns_tuple = nd.check_dns(cfg.DNS_TEST_DOMAIN)
+    dns_ok, dns_status, dns_details = dns_tuple
+    emit(
+        4, f"Resolving DNS ({cfg.DNS_TEST_DOMAIN})...", dns_status,
+        "✓" if dns_ok else "✗", dns_details,
+        "pass" if dns_ok else "fail",
+        f"Step 5: DNS Resolution -> {dns_details}", 64,
+    )
+
     internet_tuple = nd.check_internet(cfg.PING_TARGET_PRIMARY)
+    inet_ok, inet_status, inet_details = internet_tuple
+    emit(
+        5, f"Testing internet connectivity ({cfg.PING_TARGET_PRIMARY})...", inet_status,
+        "✓" if inet_ok else "✗", inet_details,
+        "pass" if inet_ok else "fail",
+        f"Step 6: Internet Access -> {inet_details}", 76,
+    )
 
-    # Measure performance against internet IP if reachable, else gateway
-    if internet_tuple[0]:
-        target = cfg.PING_TARGET_PRIMARY
-    elif gateway_tuple[2]:
-        target = gateway_tuple[1]
+    # Measure Internet performance when available; otherwise measure the LAN gateway.
+    if inet_ok:
+        target, _ = _internet_probe_target(inet_details)
+    elif gw_reachable:
+        target = gw_ip
     else:
         target = ""
-
     perf_metrics = (
         perf.measure_performance(target, cfg.PING_COUNT, cfg.PING_TIMEOUT_MS)
         if target else
         PerformanceMetrics(
             avg_latency_ms=-1, min_latency_ms=-1, max_latency_ms=-1,
-            jitter_ms=-1, packet_loss_pct=100.0, ping_count=0,
-            target_host="", error="No reachable host for performance test"
+            jitter_ms=-1, packet_loss_pct=-1.0, ping_count=0,
+            target_host="", error="No reachable host for performance test",
         )
     )
 
-    return build_diagnostic_result(
-        adapter_tuple, ip_tuple, gateway_tuple,
-        wifi_info, dns_tuple, internet_tuple, perf_metrics
+    if perf_metrics.is_valid:
+        latency_status = f"{perf_metrics.avg_latency_ms:.0f} ms"
+        latency_symbol = "✓" if perf_metrics.avg_latency_ms <= cfg.LATENCY_FAIR_MS else "⚠"
+        latency_tag = "pass" if latency_symbol == "✓" else "warn"
+        latency_details = perf_metrics.latency_display
+    else:
+        latency_status, latency_symbol, latency_tag = "N/A", "—", "muted"
+        latency_details = perf_metrics.error or "Measurement unavailable"
+    emit(
+        6, "Measuring latency and packet loss...", latency_status,
+        latency_symbol, latency_details, latency_tag,
+        f"Step 7: Latency -> {latency_details}", 88,
     )
+
+    if perf_metrics.has_packet_measurement:
+        loss_status = f"{perf_metrics.packet_loss_pct:.0f}%"
+        loss_symbol = "✓" if perf_metrics.packet_loss_pct <= cfg.LOSS_FAIR_PCT else "⚠"
+        loss_tag = "pass" if loss_symbol == "✓" else "warn"
+        loss_details = perf_metrics.loss_display
+    else:
+        loss_status, loss_symbol, loss_tag = "N/A", "—", "muted"
+        loss_details = perf_metrics.error or "Measurement unavailable"
+    emit(
+        7, "Measuring latency and packet loss...", loss_status,
+        loss_symbol, loss_details, loss_tag,
+        f"Step 8: Packet Loss -> {loss_details}", 95,
+    )
+
+    result = build_diagnostic_result(
+        adapter_tuple, ip_tuple, gateway_tuple,
+        wifi_info, dns_tuple, internet_tuple, perf_metrics,
+    )
+    if progress_callback:
+        progress_callback(None, "Diagnostic complete", "", "", "", "", "", 100)
+    return result
