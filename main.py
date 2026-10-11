@@ -14,12 +14,13 @@ Architecture:
 """
 
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
 import threading
 import queue
 import time
 import sys
 import os
+from datetime import datetime
 
 # Ensure local imports work regardless of working directory
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -30,6 +31,12 @@ import performance as perf
 import collector
 import db_manager as db
 from models import PerformanceMetrics, WiFiInfo, DiagnosticResult
+from reporting import generate_pdf_report
+from remediation import (
+    ACTION_LABELS,
+    ActionRecord,
+    execute_remediation,
+)
 
 # Import View Components
 from sidebar import Sidebar
@@ -70,6 +77,9 @@ class IntelliNetApp:
         self.is_running = False
         self.diagnostic_data: DiagnosticResult = None
         self.ui_queue = queue.Queue()
+        self.action_history = []
+        self._remediation_running = False
+        self._diagnostic_started_at = None
 
         # Monitoring state
         self._monitor_active = False
@@ -174,6 +184,23 @@ class IntelliNetApp:
         )
         self.lbl_status.pack(side="left", padx=(0, 16))
 
+        self.btn_export_pdf = tk.Button(
+            action_box,
+            text="Export PDF",
+            font=("Segoe UI", 8, "bold"),
+            bg=cfg.COLOR_PANEL_ALT,
+            fg=cfg.COLOR_TEXT_PRIMARY,
+            activebackground=cfg.COLOR_ACCENT,
+            activeforeground="#FFFFFF",
+            relief="flat",
+            cursor="hand2",
+            command=self.export_report,
+            state="disabled",
+            padx=12,
+            pady=7,
+        )
+        self.btn_export_pdf.pack(side="left", padx=(0, 8))
+
         self.btn_run = tk.Button(
             action_box,
             text="▶  Run Diagnostics",
@@ -225,7 +252,9 @@ class IntelliNetApp:
         # 5. Recommendations View
         self.pages["recommendations"] = RecommendationsView(
             self.page_container,
-            on_retest=self.start_diagnostic,
+            on_retest=lambda: self.run_remediation("rerun_diagnostics"),
+            on_flush_dns=lambda: self.run_remediation("flush_dns"),
+            on_renew_ip=lambda: self.run_remediation("renew_ip"),
         )
 
         # 6. History View (Phase 3)
@@ -291,9 +320,10 @@ class IntelliNetApp:
     def start_diagnostic(self):
         """Trigger background diagnostic run."""
         if self.is_running:
-            return
+            return False
 
         self.is_running = True
+        self._diagnostic_started_at = datetime.now()
         self.btn_run.config(state="disabled", bg=cfg.COLOR_PANEL_ALT)
         self.progress_bar["value"] = 0
         self.lbl_status.config(text="Scanning network...", fg=cfg.COLOR_WARNING)
@@ -311,6 +341,7 @@ class IntelliNetApp:
         )
 
         threading.Thread(target=self._run_diagnostic_worker, daemon=True).start()
+        return True
 
     def _run_diagnostic_worker(self):
         """
@@ -485,6 +516,13 @@ class IntelliNetApp:
         self.is_running = False
         self.diagnostic_data = result
         self.btn_run.config(state="normal", bg=cfg.COLOR_ACCENT)
+        self.btn_export_pdf.config(state="normal")
+        self._record_action(
+            "Run diagnostics",
+            "Completed",
+            f"Health score: {result.health.score}/100; {result.rca.overall_status}.",
+            self._diagnostic_started_at,
+        )
 
         # Status text
         hlth = result.health
@@ -517,12 +555,177 @@ class IntelliNetApp:
         """Handle worker errors safely on the main thread."""
         self.is_running = False
         self.btn_run.config(state="normal", bg=cfg.COLOR_ACCENT)
+        self._record_action(
+            "Run diagnostics",
+            "Failed",
+            err_msg,
+            self._diagnostic_started_at,
+        )
         self.lbl_status.config(text=f"Error: {err_msg}", fg=cfg.COLOR_FAILURE)
 
         diag_view: DiagnosticsView = self.pages["diagnostics"]
         diag_view.append_log(f"ERROR: Diagnostic worker exception: {err_msg}")
 
         db.log_event("ERROR", f"Diagnostic error: {err_msg}", severity="CRITICAL")
+
+    def export_report(self):
+        """Save the latest completed diagnostic and session actions as a PDF."""
+        if not self.diagnostic_data:
+            messagebox.showwarning(
+                "No diagnostic available",
+                "Run diagnostics before exporting a report.",
+                parent=self.root,
+            )
+            return
+
+        suggested_name = (
+            "IntelliNet_Report_"
+            + self.diagnostic_data.timestamp.strftime("%Y%m%d_%H%M%S")
+            + ".pdf"
+        )
+        destination = filedialog.asksaveasfilename(
+            parent=self.root,
+            title="Export diagnostic report",
+            defaultextension=".pdf",
+            initialfile=suggested_name,
+            filetypes=[("PDF report", "*.pdf")],
+        )
+        if not destination:
+            return
+
+        try:
+            path = generate_pdf_report(
+                self.diagnostic_data,
+                destination,
+                actions=self.action_history,
+            )
+        except Exception as exc:
+            messagebox.showerror(
+                "Report export failed",
+                f"The PDF report could not be created:\n{exc}",
+                parent=self.root,
+            )
+            return
+
+        messagebox.showinfo(
+            "Report exported",
+            f"Diagnostic report saved to:\n{path}",
+            parent=self.root,
+        )
+
+    def run_remediation(self, action: str):
+        """Confirm and dispatch one of the available remediation actions."""
+        if action == "rerun_diagnostics":
+            outcome = execute_remediation(
+                action,
+                diagnostic_callback=self.start_diagnostic,
+            )
+            if not outcome.succeeded:
+                messagebox.showwarning(
+                    "Diagnostics not started",
+                    outcome.message,
+                    parent=self.root,
+                )
+            return
+
+        label = ACTION_LABELS.get(action)
+        if not label:
+            messagebox.showerror(
+                "Unsupported action",
+                "This remediation action is not available.",
+                parent=self.root,
+            )
+            return
+        if self._remediation_running:
+            messagebox.showinfo(
+                "Action in progress",
+                "Please wait for the current network action to finish.",
+                parent=self.root,
+            )
+            return
+
+        prompts = {
+            "flush_dns": (
+                "Flush the Windows DNS resolver cache now? "
+                "This clears cached name lookups and may briefly affect name resolution."
+            ),
+            "renew_ip": (
+                "Renew DHCP IPv4 leases for configured adapters now? "
+                "Network connectivity may be interrupted briefly while Windows requests new leases."
+            ),
+        }
+        if action not in prompts:
+            messagebox.showerror(
+                "Unsupported action",
+                "This remediation action is not available.",
+                parent=self.root,
+            )
+            return
+        if not messagebox.askyesno(
+            f"Confirm {label}",
+            prompts[action],
+            icon="warning",
+            parent=self.root,
+        ):
+            return
+
+        self._remediation_running = True
+        self.lbl_status.config(text=f"Running {label.lower()}...", fg=cfg.COLOR_WARNING)
+        threading.Thread(
+            target=self._run_remediation_worker,
+            args=(action,),
+            daemon=True,
+        ).start()
+
+    def _run_remediation_worker(self, action: str):
+        """Run a previously confirmed action without blocking the GUI."""
+        outcome = execute_remediation(action, confirmed=True)
+        self._dispatch_ui(lambda: self._finalize_remediation(outcome))
+
+    def _finalize_remediation(self, outcome):
+        """Record remediation results and report them to the user."""
+        self._remediation_running = False
+        label = ACTION_LABELS.get(outcome.action, outcome.action)
+        self._record_action(label, outcome.status.title(), outcome.message, outcome.timestamp)
+
+        severity = "INFO" if outcome.succeeded else "WARNING"
+        try:
+            db.log_event(
+                "REMEDIATION",
+                f"{label}: {outcome.status}",
+                severity=severity,
+                details=outcome.message,
+            )
+        except Exception:
+            pass
+
+        self.lbl_status.config(
+            text=f"{label}: {outcome.status}",
+            fg=cfg.COLOR_SUCCESS if outcome.succeeded else cfg.COLOR_FAILURE,
+        )
+        if outcome.succeeded:
+            messagebox.showinfo(
+                "Network action completed",
+                outcome.message,
+                parent=self.root,
+            )
+        else:
+            messagebox.showerror(
+                "Network action failed",
+                outcome.message,
+                parent=self.root,
+            )
+
+    def _record_action(self, action: str, status: str, details: str, timestamp=None):
+        """Keep a report-ready in-memory history for this application session."""
+        record = ActionRecord(
+            action=action,
+            status=status,
+            details=details,
+            timestamp=timestamp or datetime.now(),
+        )
+        self.action_history.append(record)
+        return record
 
     def _show_degradation_alerts(self, alerts: list):
         """Show degradation alerts on the monitoring page."""

@@ -23,7 +23,8 @@ The objective of this project is to create an automated, offline-friendly networ
   8. **Recommendation Generation**: Displays direct user guidance for resolving the issue.
 - **Multithreaded Responsive GUI**: Built with Tkinter; background execution prevents window freezing during ping or DNS timeouts.
 - **Real-Time Progress Feedback**: Displays live progress bar and status steps during scanning.
-- **Report Export**: Allows saving full diagnostic results as a formatted `.txt` report.
+- **PDF Diagnostic Reports**: Exports an executive summary, network configuration, connectivity and performance results, root-cause analysis, confidence score, recommendations, and session actions performed.
+- **Safe Quick Remediation**: Flushes the DNS cache or renews the DHCP address only after explicit confirmation. Diagnostics can be re-run without changing network configuration.
 - **Zero External Cloud Dependencies**: Works entirely locally without third-party APIs or database servers.
 
 ---
@@ -38,6 +39,7 @@ The objective of this project is to create an automated, offline-friendly networ
 | **`socket`** | Standard library module for DNS resolution testing |
 | **`subprocess`** | Windows command execution (`ipconfig`, `ping`, `route`) |
 | **`threading`** | Asynchronous execution to keep GUI active |
+| **ReportLab** | Structured PDF report generation |
 
 ---
 
@@ -72,6 +74,10 @@ Execute the main application using Python:
 ```bash
 python main.py
 ```
+
+## Automated Checks
+
+Run the report and remediation unit tests with: python -m unittest discover -s tests -v
 
 ---
 
@@ -144,9 +150,13 @@ To test and demonstrate the framework during project presentation:
 ```
 Automated-Network-Diagnostic/
 │
-├── main.py                  # Tkinter GUI, progress bar, background threads, report export
-├── network_diagnostics.py   # Diagnostic engine, adapter check, ping, gateway lookup, DNS & internet test
-├── requirements.txt         # Required Python packages (psutil)
+├── main.py                  # Tkinter GUI, diagnostics, PDF export, and remediation confirmations
+├── reporting.py             # Structured PDF diagnostic report generator
+├── remediation.py           # Confirmed DNS flush, IP renewal, and diagnostic rerun actions
+├── network_diagnostics.py   # Adapter, IP, gateway, DNS, connectivity, and Wi-Fi probes
+├── models.py                # Typed diagnostic and remediation data
+├── tests/                   # Report, network configuration, and remediation unit tests
+├── requirements.txt         # Required Python packages
 ├── README.md                # Full project documentation & presentation guide
 └── screenshots/             # Interface preview screenshots
 ```
@@ -155,9 +165,6 @@ Automated-Network-Diagnostic/
 
 ## 🔮 Future Enhancements
 
-- Automatic IP renewal capability (`ipconfig /renew`).
-- DNS flush integration (`ipconfig /flushdns`).
-- Wi-Fi Signal Strength (RSSI) indicator.
 - Speed test integration using socket throughput estimation.
 - Automatic log generation for network administrator diagnostics.
 

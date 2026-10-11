@@ -18,9 +18,18 @@ class RecommendationsView(tk.Frame):
       - Actionable Remediation Plan: Numbered step-by-step guidance cards.
     """
 
-    def __init__(self, parent, on_retest: Optional[Callable[[], None]] = None, **kw):
+    def __init__(
+        self,
+        parent,
+        on_retest: Optional[Callable[[], None]] = None,
+        on_flush_dns: Optional[Callable[[], None]] = None,
+        on_renew_ip: Optional[Callable[[], None]] = None,
+        **kw,
+    ):
         super().__init__(parent, bg=cfg.COLOR_BG, **kw)
         self.on_retest = on_retest
+        self.on_flush_dns = on_flush_dns
+        self.on_renew_ip = on_renew_ip
         self.step_frames = []
         self._build_ui()
 
@@ -168,6 +177,52 @@ class RecommendationsView(tk.Frame):
                 pady=3,
             )
             btn_retest.pack(side="right")
+
+        # Safe remediation controls. The coordinator asks for confirmation
+        # before dispatching either network-changing action.
+        action_row = tk.Frame(plan_card, bg=cfg.COLOR_PANEL)
+        action_row.pack(fill="x", pady=(0, 8))
+        tk.Label(
+            action_row,
+            text="Quick fixes (confirmation required)",
+            font=("Segoe UI", 8, "bold"),
+            bg=cfg.COLOR_PANEL,
+            fg=cfg.COLOR_TEXT_MUTED,
+        ).pack(side="left")
+
+        if self.on_renew_ip:
+            self.btn_renew_ip = tk.Button(
+                action_row,
+                text="Renew IP",
+                font=("Segoe UI", 8, "bold"),
+                bg=cfg.COLOR_PANEL_ALT,
+                fg=cfg.COLOR_TEXT_PRIMARY,
+                activebackground=cfg.COLOR_ACCENT,
+                activeforeground="#FFFFFF",
+                relief="flat",
+                cursor="hand2",
+                command=self.on_renew_ip,
+                padx=10,
+                pady=4,
+            )
+            self.btn_renew_ip.pack(side="right", padx=(6, 0))
+
+        if self.on_flush_dns:
+            self.btn_flush_dns = tk.Button(
+                action_row,
+                text="Flush DNS",
+                font=("Segoe UI", 8, "bold"),
+                bg=cfg.COLOR_PANEL_ALT,
+                fg=cfg.COLOR_TEXT_PRIMARY,
+                activebackground=cfg.COLOR_ACCENT,
+                activeforeground="#FFFFFF",
+                relief="flat",
+                cursor="hand2",
+                command=self.on_flush_dns,
+                padx=10,
+                pady=4,
+            )
+            self.btn_flush_dns.pack(side="right")
 
         # Scrollable container for steps
         canvas = tk.Canvas(plan_card, bg=cfg.COLOR_PANEL, highlightthickness=0)
