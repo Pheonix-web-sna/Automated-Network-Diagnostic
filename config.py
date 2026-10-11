@@ -14,17 +14,22 @@ PING_TARGET_PRIMARY   = "8.8.8.8"      # Google Public DNS (ICMP target)
 PING_TARGET_SECONDARY = "1.1.1.1"      # Cloudflare DNS (fallback ICMP)
 TCP_FALLBACK_HOST     = "8.8.8.8"
 TCP_FALLBACK_PORT     = 53             # DNS port — almost never firewalled
+TCP_FALLBACK_TIMEOUT_SEC = 2
 
 # ── DNS Resolution Test ───────────────────────────────────────────────────────
 DNS_TEST_DOMAIN           = "google.com"
-DNS_TEST_DOMAIN_SECONDARY = "cloudflare.com"
 DNS_SOCKET_TIMEOUT_SEC    = 3
+DNS_SERVER_QUERY_TIMEOUT_SEC = 8
+NETWORK_COMMAND_TIMEOUT_SEC = 6
 
 # ── Ping Parameters ───────────────────────────────────────────────────────────
 PING_COUNT          = 4       # Number of pings for performance measurement
 PING_TIMEOUT_MS     = 2000    # Per-ping timeout (ms) passed to Windows ping -w
-GATEWAY_PING_COUNT  = 1       # Single ping is enough for gateway reachability
 QUICK_PING_TIMEOUT  = 2       # Seconds for quick single-ping check
+PING_QUICK_TIMEOUT_BUFFER_SEC = 3
+PING_PROCESS_TIMEOUT_BUFFER_SEC = 4
+JITTER_STABLE_MS    = 15
+REMEDIATION_COMMAND_TIMEOUT_SEC = 60
 
 # ── Latency Thresholds (ms) ───────────────────────────────────────────────────
 LATENCY_EXCELLENT_MS  = 30
@@ -74,12 +79,17 @@ COLOR_TEAL         = "#14B8A6"   # Teal   — performance metric accent
 
 # ── Database / Storage (Phase 3) ──────────────────────────────────────────────
 DB_FILENAME      = "intellinet.db"
+DB_BUSY_TIMEOUT_SEC = 10
 MAX_HISTORY_SESSIONS = 500
+MAX_EVENT_LOG_ENTRIES = 1000
+MAX_DIAGNOSTIC_LOG_LINES = 500
+MAX_MONITOR_LOG_LINES = 500
 
 # ── Monitoring Defaults ───────────────────────────────────────────────────────
 MONITOR_DEFAULT_INTERVAL_SEC = 60     # Default scan interval in seconds
 MONITOR_MIN_INTERVAL_SEC     = 30     # Minimum allowed interval
 MONITOR_MAX_INTERVAL_SEC     = 600    # Maximum allowed interval
+MONITOR_INTERVAL_OPTIONS = (30, 60, 120, 300, 600)
 
 # ── Degradation Detection Thresholds ──────────────────────────────────────────
 DEGRADE_HEALTH_DROP_PTS      = 15     # Alert if health drops > N pts vs avg

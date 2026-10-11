@@ -13,6 +13,7 @@ Live network monitoring dashboard:
 import tkinter as tk
 from tkinter import ttk
 from datetime import datetime
+import logging
 import config as cfg
 from models import DiagnosticResult
 
@@ -94,11 +95,11 @@ class MonitoringView(tk.Frame):
             bg=cfg.COLOR_PANEL, fg=cfg.COLOR_TEXT_MUTED,
         ).pack(side="left")
 
-        self.interval_var = tk.StringVar(value="60")
+        self.interval_var = tk.StringVar(value=str(cfg.MONITOR_DEFAULT_INTERVAL_SEC))
         interval_combo = ttk.Combobox(
             interval_row,
             textvariable=self.interval_var,
-            values=["30", "60", "120", "300", "600"],
+            values=[str(value) for value in cfg.MONITOR_INTERVAL_OPTIONS],
             state="readonly",
             width=6,
         )
@@ -376,10 +377,14 @@ class MonitoringView(tk.Frame):
         self.event_text.config(state="normal")
         self.event_text.insert("end", line, tag)
         self.event_text.see("end")
+        line_count = max(0, int(self.event_text.index("end-1c").split(".")[0]) - 1)
+        excess = line_count - cfg.MAX_MONITOR_LOG_LINES
+        if excess > 0:
+            self.event_text.delete("1.0", f"{excess + 1}.0")
         self.event_text.config(state="disabled")
 
         # Update count
-        lines = int(self.event_text.index("end-1c").split(".")[0])
+        lines = max(0, int(self.event_text.index("end-1c").split(".")[0]) - 1)
         self.event_count_lbl.config(text=f"{lines} events")
 
     def _refresh_event_log(self):
@@ -408,7 +413,7 @@ class MonitoringView(tk.Frame):
             self.event_count_lbl.config(text=f"{count} events")
 
         except Exception:
-            pass
+            logging.exception("Could not refresh monitoring event history")
 
     def update_data(self, result: DiagnosticResult):
         """Called after each diagnostic — refresh event log."""

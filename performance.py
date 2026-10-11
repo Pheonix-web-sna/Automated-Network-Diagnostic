@@ -23,7 +23,7 @@ def _unavailable(host: str, reason: str) -> PerformanceMetrics:
         min_latency_ms=-1,
         max_latency_ms=-1,
         jitter_ms=-1,
-        packet_loss_pct=100.0,
+        packet_loss_pct=-1.0,
         ping_count=0,
         target_host=host,
         error=reason,
@@ -42,8 +42,21 @@ def _parse_ping_output(output: str, count: int, host: str) -> PerformanceMetrics
     """
     # ── Packet loss ──────────────────────────────────────────────────────────
     # "Packets: Sent = 4, Received = 3, Lost = 1 (25% loss)"
-    loss_m = re.search(r"\((\d+)%\s*loss\)", output, re.IGNORECASE)
-    packet_loss = float(loss_m.group(1)) if loss_m else 100.0
+    summary_m = re.search(
+        r"Sent\s*=\s*(\d+)\s*,\s*Received\s*=\s*(\d+)\s*,\s*Lost\s*=\s*(\d+)",
+        output,
+        re.IGNORECASE,
+    )
+    if summary_m:
+        sent = int(summary_m.group(1))
+        received = int(summary_m.group(2))
+        lost = int(summary_m.group(3))
+        packet_loss = (lost / sent * 100) if sent else 100.0
+    else:
+        sent = count
+        received = None
+        loss_m = re.search(r"\((\d+(?:\.\d+)?)%\s*loss\)", output, re.IGNORECASE)
+        packet_loss = float(loss_m.group(1)) if loss_m else None
 
     # ── Latency — Method A: summary line ────────────────────────────────────
     stats_m = re.search(
@@ -60,8 +73,8 @@ def _parse_ping_output(output: str, count: int, host: str) -> PerformanceMetrics
             min_latency_ms=round(min_ms, 1),
             max_latency_ms=round(max_ms, 1),
             jitter_ms=jitter,
-            packet_loss_pct=packet_loss,
-            ping_count=count,
+            packet_loss_pct=packet_loss if packet_loss is not None else 0.0,
+            ping_count=sent,
             target_host=host,
         )
 
@@ -70,6 +83,10 @@ def _parse_ping_output(output: str, count: int, host: str) -> PerformanceMetrics
     rtts = re.findall(r"time[=<](\d+)ms", output, re.IGNORECASE)
     if rtts:
         vals   = [int(r) for r in rtts]
+        if received is None:
+            received = len(vals)
+        if packet_loss is None and sent > 0:
+            packet_loss = max(0.0, (sent - received) / sent * 100)
         avg_ms = sum(vals) / len(vals)
         min_ms = float(min(vals))
         max_ms = float(max(vals))
@@ -78,12 +95,28 @@ def _parse_ping_output(output: str, count: int, host: str) -> PerformanceMetrics
             min_latency_ms=round(min_ms, 1),
             max_latency_ms=round(max_ms, 1),
             jitter_ms=round(max_ms - min_ms, 1),
-            packet_loss_pct=packet_loss,
-            ping_count=count,
+            packet_loss_pct=packet_loss if packet_loss is not None else 0.0,
+            ping_count=sent,
             target_host=host,
         )
 
-    # Completely failed — no RTT data found
+    # A completed sequence with no replies still provides a real 100% loss
+    # measurement even though latency itself is unavailable.
+    if sent > 0 and (packet_loss is not None or summary_m):
+        if packet_loss is None:
+            packet_loss = 100.0
+        return PerformanceMetrics(
+            avg_latency_ms=-1,
+            min_latency_ms=-1,
+            max_latency_ms=-1,
+            jitter_ms=-1,
+            packet_loss_pct=packet_loss,
+            ping_count=sent,
+            target_host=host,
+            error="No ICMP echo replies received; the target may filter ICMP.",
+        )
+
+    # Completely failed — no packet summary and no RTT data found.
     return _unavailable(host, "No RTT data in ping output")
 
 
@@ -108,7 +141,9 @@ def measure_performance(
 
     try:
         # Total subprocess timeout = per-packet timeout * count + buffer
-        total_timeout = int((timeout_ms / 1000 + 0.5) * count + 4)
+        total_timeout = int(
+            (timeout_ms / 1000 + 0.5) * count + cfg.PING_PROCESS_TIMEOUT_BUFFER_SEC
+        )
         flags = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0
 
         cmd = ["ping", "-n", str(count), "-w", str(timeout_ms), host]
@@ -131,23 +166,3 @@ def measure_performance(
         return _unavailable(host, "ping command not found")
     except Exception as e:
         return _unavailable(host, str(e))
-
-
-def get_performance_rating(metrics: PerformanceMetrics) -> str:
-    """
-    Return a one-word human-readable rating for latency.
-    Used by rca_engine for performance-based diagnosis.
-    """
-    if not metrics.is_valid:
-        return "Unknown"
-    lat = metrics.avg_latency_ms
-    if lat <= cfg.LATENCY_EXCELLENT_MS:
-        return "Excellent"
-    elif lat <= cfg.LATENCY_GOOD_MS:
-        return "Good"
-    elif lat <= cfg.LATENCY_FAIR_MS:
-        return "Fair"
-    elif lat <= cfg.LATENCY_POOR_MS:
-        return "Poor"
-    else:
-        return "Critical"

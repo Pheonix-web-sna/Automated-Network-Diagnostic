@@ -179,7 +179,7 @@ class PerformanceView(tk.Frame):
 
         self.lbl_pkt_summary = tk.Label(
             packet_card,
-            text="4 / 4 Packets Received (100% Delivery)",
+            text="Packet measurement pending",
             font=("Segoe UI", 11, "bold"),
             bg=cfg.COLOR_PANEL,
             fg=cfg.COLOR_SUCCESS,
@@ -194,11 +194,11 @@ class PerformanceView(tk.Frame):
             maximum=100,
         )
         self.pkt_progress.pack(fill="x", pady=(0, 10))
-        self.pkt_progress["value"] = 100
+        self.pkt_progress["value"] = 0
 
         self.lbl_pkt_detail = tk.Label(
             packet_card,
-            text="Sent: 4 | Received: 4 | Lost: 0 (0% Loss)",
+            text="No ping sequence completed",
             font=("Segoe UI", 8),
             bg=cfg.COLOR_PANEL,
             fg=cfg.COLOR_TEXT_MUTED,
@@ -296,80 +296,104 @@ class PerformanceView(tk.Frame):
     def update_data(self, result: DiagnosticResult):
         """Update metrics and assessments using measured PerformanceMetrics."""
         p = result.performance
-
-        if not p.is_valid:
+        if p.is_valid:
+            lat = p.avg_latency_ms
+            lat_col = (
+                cfg.COLOR_SUCCESS if lat <= cfg.LATENCY_GOOD_MS else
+                (cfg.COLOR_WARNING if lat <= cfg.LATENCY_FAIR_MS else cfg.COLOR_FAILURE)
+            )
+            self.c_lat["val"].config(text=f"{lat:.0f} ms", fg=lat_col)
+            self.c_lat["sub"].config(text=f"Rating: {p.latency_rating}")
+            self.c_jit["val"].config(text=f"{p.jitter_ms:.0f} ms")
+            self.c_jit["sub"].config(
+                text="Stable delay" if p.jitter_ms <= cfg.JITTER_STABLE_MS else "Variable network delay",
+                fg=cfg.COLOR_SUCCESS if p.jitter_ms <= cfg.JITTER_STABLE_MS else cfg.COLOR_WARNING,
+            )
+            self.c_rng["val"].config(text=f"{p.min_latency_ms:.0f}ms / {p.max_latency_ms:.0f}ms")
+            self.c_rng["sub"].config(text=f"Difference: {p.jitter_ms:.0f}ms")
+            self.meter.update_latency(lat)
+            self.lbl_target_info.config(
+                text=f"Ping target: {p.target_host} | {p.ping_count} probes | Average {lat:.1f}ms",
+            )
+        else:
+            reason = p.error or "Latency measurement unavailable"
             self.c_lat["val"].config(text="N/A", fg=cfg.COLOR_TEXT_MUTED)
-            self.c_lat["sub"].config(text="Host unreachable")
-            self.c_jit["val"].config(text="N/A")
-            self.c_los["val"].config(text="100%", fg=cfg.COLOR_FAILURE)
-            self.c_rng["val"].config(text="—")
+            self.c_lat["sub"].config(text=reason)
+            self.c_jit["val"].config(text="N/A", fg=cfg.COLOR_TEXT_MUTED)
+            self.c_jit["sub"].config(text="Not measured", fg=cfg.COLOR_TEXT_MUTED)
+            self.c_rng["val"].config(text="N/A", fg=cfg.COLOR_TEXT_MUTED)
+            self.c_rng["sub"].config(text="Not measured", fg=cfg.COLOR_TEXT_MUTED)
             self.meter.update_latency(-1)
-            self.lbl_pkt_summary.config(text="All Packets Lost (100% Loss)", fg=cfg.COLOR_FAILURE)
+            self.lbl_target_info.config(
+                text=f"Ping target: {p.target_host or 'Not available'} | {reason}",
+            )
+
+        if p.has_packet_measurement:
+            loss = p.packet_loss_pct
+            received = round(p.ping_count * (1 - loss / 100))
+            lost = p.ping_count - received
+            delivery_pct = 100.0 - loss
+            loss_col = cfg.COLOR_SUCCESS if loss <= cfg.LOSS_GOOD_PCT else (
+                cfg.COLOR_WARNING if loss <= cfg.LOSS_FAIR_PCT else cfg.COLOR_FAILURE
+            )
+            self.c_los["val"].config(text=f"{loss:.0f}%", fg=loss_col)
+            self.c_los["sub"].config(text=f"{lost} lost of {p.ping_count} probes")
+            self.lbl_pkt_summary.config(
+                text=f"{received} / {p.ping_count} probes received ({delivery_pct:.0f}% delivery)",
+                fg=loss_col,
+            )
+            self.pkt_progress["value"] = delivery_pct
+            self.lbl_pkt_detail.config(
+                text=f"Sent: {p.ping_count} | Received: {received} | Lost: {lost} ({loss:.0f}% loss)"
+            )
+        else:
+            self.c_los["val"].config(text="N/A", fg=cfg.COLOR_TEXT_MUTED)
+            self.c_los["sub"].config(text="No packet measurement", fg=cfg.COLOR_TEXT_MUTED)
+            self.lbl_pkt_summary.config(text="Packet loss unavailable", fg=cfg.COLOR_TEXT_MUTED)
             self.pkt_progress["value"] = 0
-            self.lbl_pkt_detail.config(text=f"Sent: {cfg.PING_COUNT} | Received: 0 | Lost: {cfg.PING_COUNT}")
+            self.lbl_pkt_detail.config(text=p.error or "No ping sequence was completed.")
+
+        if not result.internet.is_connected or not p.is_valid or not p.has_packet_measurement:
+            if not result.internet.is_connected:
+                text = "Internet unavailable; application quality cannot be estimated."
+            elif not p.is_valid:
+                text = "Insufficient latency data to estimate application quality."
+            else:
+                text = "Packet-loss measurement unavailable; application quality cannot be estimated."
+            for tile in (
+                self.app_browsing, self.app_calls, self.app_gaming, self.app_downloads
+            ):
+                tile["status"].config(text=text, fg=cfg.COLOR_TEXT_MUTED)
             return
 
-        # ── Card 1: Avg Latency ──
         lat = p.avg_latency_ms
-        lat_col = (
-            cfg.COLOR_SUCCESS if lat <= cfg.LATENCY_GOOD_MS else
-            (cfg.COLOR_WARNING if lat <= cfg.LATENCY_FAIR_MS else cfg.COLOR_FAILURE)
-        )
-        self.c_lat["val"].config(text=f"{lat:.0f} ms", fg=lat_col)
-        self.c_lat["sub"].config(text=f"Rating: {p.latency_rating}")
-
-        # ── Card 2: Jitter ──
-        self.c_jit["val"].config(text=f"{p.jitter_ms:.0f} ms")
-        self.c_jit["sub"].config(
-            text="Stable delay" if p.jitter_ms <= 15 else "Variable network delay",
-            fg=cfg.COLOR_SUCCESS if p.jitter_ms <= 15 else cfg.COLOR_WARNING,
-        )
-
-        # ── Card 3: Packet Loss ──
-        loss = p.packet_loss_pct
-        loss_col = cfg.COLOR_SUCCESS if loss <= cfg.LOSS_GOOD_PCT else cfg.COLOR_FAILURE
-        self.c_los["val"].config(text=f"{loss:.0f} %", fg=loss_col)
-        received = round(p.ping_count * (1 - loss / 100))
-        lost = p.ping_count - received
-        self.c_los["sub"].config(text=f"{lost} lost of {p.ping_count} packets")
-
-        # ── Card 4: RTT Spread ──
-        self.c_rng["val"].config(text=f"{p.min_latency_ms:.0f}ms / {p.max_latency_ms:.0f}ms")
-        self.c_rng["sub"].config(text=f"Difference: {p.jitter_ms:.0f}ms")
-
-        # ── Visual Meter ──
-        self.meter.update_latency(lat)
-        self.lbl_target_info.config(
-            text=f"Ping Target: {p.target_host} | Pings: {p.ping_count} packets | Avg: {lat:.1f}ms",
-        )
-
-        # ── Packet Delivery ──
-        delivery_pct = 100.0 - loss
-        self.lbl_pkt_summary.config(
-            text=f"{received} / {p.ping_count} Packets Received ({delivery_pct:.0f}% Delivery)",
-            fg=cfg.COLOR_SUCCESS if loss == 0 else (cfg.COLOR_WARNING if loss <= 10 else cfg.COLOR_FAILURE),
-        )
-        self.pkt_progress["value"] = delivery_pct
-        self.lbl_pkt_detail.config(text=f"Sent: {p.ping_count} | Received: {received} | Lost: {lost} ({loss:.0f}% Loss)")
-
-        # ── Application Usability Evaluation ──
-        if lat <= 50 and loss == 0:
-            self.app_browsing["status"].config(text="Excellent — Instant page loads", fg=cfg.COLOR_SUCCESS)
-            self.app_calls["status"].config(text="Crystal Clear — Low latency", fg=cfg.COLOR_SUCCESS)
-            self.app_gaming["status"].config(text="Optimal — Competitive grade", fg=cfg.COLOR_SUCCESS)
-            self.app_downloads["status"].config(text="Maximum throughput", fg=cfg.COLOR_SUCCESS)
-        elif lat <= 100 and loss <= 2:
-            self.app_browsing["status"].config(text="Good — Responsive browsing", fg=cfg.COLOR_SUCCESS)
-            self.app_calls["status"].config(text="Good — Minor delay", fg=cfg.COLOR_SUCCESS)
-            self.app_gaming["status"].config(text="Playable — Moderate latency", fg=cfg.COLOR_WARNING)
-            self.app_downloads["status"].config(text="Stable streaming", fg=cfg.COLOR_SUCCESS)
-        elif lat <= 200:
-            self.app_browsing["status"].config(text="Fair — Noticeable lag", fg=cfg.COLOR_WARNING)
-            self.app_calls["status"].config(text="Degraded — Possible audio drops", fg=cfg.COLOR_WARNING)
-            self.app_gaming["status"].config(text="Poor — High input delay", fg=cfg.COLOR_FAILURE)
-            self.app_downloads["status"].config(text="Occasional buffering", fg=cfg.COLOR_WARNING)
+        loss = p.packet_loss_pct if p.has_packet_measurement else 0
+        if lat <= cfg.LATENCY_EXCELLENT_MS and loss <= cfg.LOSS_EXCELLENT_PCT:
+            labels = (
+                "Excellent — Instant page loads", "Crystal Clear — Low latency",
+                "Optimal — Competitive grade", "Maximum throughput",
+            )
+            color = cfg.COLOR_SUCCESS
+        elif lat <= cfg.LATENCY_GOOD_MS and loss <= cfg.LOSS_GOOD_PCT:
+            labels = (
+                "Good — Responsive browsing", "Good — Minor delay",
+                "Playable — Moderate latency", "Stable streaming",
+            )
+            color = cfg.COLOR_SUCCESS
+        elif lat <= cfg.LATENCY_POOR_MS and loss <= cfg.LOSS_POOR_PCT:
+            labels = (
+                "Fair — Noticeable lag", "Degraded — Possible audio drops",
+                "Poor — High input delay", "Occasional buffering",
+            )
+            color = cfg.COLOR_WARNING
         else:
-            self.app_browsing["status"].config(text="Critical — Severe slowdowns", fg=cfg.COLOR_FAILURE)
-            self.app_calls["status"].config(text="Unusable — Calls will disconnect", fg=cfg.COLOR_FAILURE)
-            self.app_gaming["status"].config(text="Unplayable — Desync / lag", fg=cfg.COLOR_FAILURE)
-            self.app_downloads["status"].config(text="Frequent timeouts", fg=cfg.COLOR_FAILURE)
+            labels = (
+                "Critical — Severe slowdowns", "Unusable — Calls may disconnect",
+                "Unplayable — High lag or loss", "Frequent timeouts",
+            )
+            color = cfg.COLOR_FAILURE
+        for tile, label in zip(
+            (self.app_browsing, self.app_calls, self.app_gaming, self.app_downloads),
+            labels,
+        ):
+            tile["status"].config(text=label, fg=color)

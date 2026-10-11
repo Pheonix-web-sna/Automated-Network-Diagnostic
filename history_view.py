@@ -12,6 +12,7 @@ Displays historical diagnostic data with matplotlib charts:
 import tkinter as tk
 from tkinter import ttk
 from datetime import datetime
+import logging
 import config as cfg
 from models import DiagnosticResult
 
@@ -281,7 +282,7 @@ class HistoryView(tk.Frame):
             self._populate_table(sessions)
 
         except Exception:
-            pass
+            logging.exception("Could not load diagnostic history")
 
     def _parse_ts(self, ts_str: str) -> datetime:
         """Parse timestamp string."""

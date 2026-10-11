@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime
 import subprocess
 from typing import Callable, Optional, Sequence
+import config as cfg
 
 
 ACTION_LABELS = {
@@ -90,7 +91,7 @@ def execute_remediation(
             check=False,
             capture_output=True,
             text=True,
-            timeout=60,
+            timeout=cfg.REMEDIATION_COMMAND_TIMEOUT_SEC,
             shell=False,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )

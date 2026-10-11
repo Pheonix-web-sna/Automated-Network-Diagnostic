@@ -5,3 +5,7 @@ __pycache__/
 .pytest_cache/
 .vscode/
 .idea/
+data/*.db
+data/*.db-*
+*.sqlite
+*.sqlite3

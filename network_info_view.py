@@ -117,7 +117,7 @@ class NetworkInfoView(tk.Frame):
         # ── Card 4: DNS Configuration ────────────────────────────────
         card_dns = self._create_section(col_right, "🌐  DNS Resolution Targets")
         self._add_row(card_dns, "Primary Test Domain", "dns_domain", cfg.DNS_TEST_DOMAIN)
-        self._add_row(card_dns, "Secondary Test Domain", "dns_sec_domain", cfg.DNS_TEST_DOMAIN_SECONDARY)
+        self._add_row(card_dns, "DNS Test Domain", "dns_sec_domain", cfg.DNS_TEST_DOMAIN)
         self._add_row(card_dns, "Primary DNS IP Target", "dns_target", cfg.PING_TARGET_PRIMARY)
         self._add_row(card_dns, "Secondary DNS IP Target", "dns_sec_target", cfg.PING_TARGET_SECONDARY)
         self._add_row(card_dns, "DNS Status", "dns_status", "—")
@@ -189,7 +189,7 @@ class NetworkInfoView(tk.Frame):
         self.labels["mac_address"].config(text=a.mac_address or "Not Available")
         self.labels["link_speed"].config(text=f"{a.speed_mbps} Mbps" if a.speed_mbps > 0 else "Active")
         self.labels["ip_address"].config(text=ip.ipv4)
-        self.labels["subnet_mask"].config(text=ip.subnet_mask or "255.255.255.0")
+        self.labels["subnet_mask"].config(text=ip.subnet_mask or "Not available")
         self.labels["gateway_ip"].config(text=gw.ip)
         self.labels["gateway_reach"].config(
             text="Reachable ✓" if gw.is_reachable else "Unreachable ✗",
@@ -204,6 +204,9 @@ class NetworkInfoView(tk.Frame):
             self.labels["packets_recv"].config(text=f"{stats.get('packets_recv', 0):,}")
             self.labels["errors"].config(text=f"{stats.get('errin', 0)} in / {stats.get('errout', 0)} out")
             self.labels["drops"].config(text=f"{stats.get('dropin', 0)} in / {stats.get('dropout', 0)} out")
+        else:
+            for key in ("bytes_sent", "bytes_recv", "packets_sent", "packets_recv", "errors", "drops"):
+                self.labels[key].config(text="Not available")
 
         # Wi-Fi
         if w.is_wifi:
@@ -211,27 +214,52 @@ class NetworkInfoView(tk.Frame):
             self.labels["wifi_ssid"].config(text=w.ssid if w.ssid else "Connected")
             self.labels["wifi_bssid"].config(text=w.bssid if w.bssid else "N/A")
 
-            sig = max(0, w.signal_pct)
-            self.lbl_sig_pct.config(
-                text=f"{sig}%",
-                fg=cfg.COLOR_SUCCESS if sig >= 70 else (cfg.COLOR_WARNING if sig >= 40 else cfg.COLOR_FAILURE),
-            )
-            self.sig_bar["value"] = sig
+            if w.signal_pct >= 0:
+                sig = w.signal_pct
+                self.lbl_sig_pct.config(
+                    text=f"{sig}%",
+                    fg=cfg.COLOR_SUCCESS if sig >= 70 else (cfg.COLOR_WARNING if sig >= 40 else cfg.COLOR_FAILURE),
+                )
+                self.sig_bar["value"] = sig
+            else:
+                self.lbl_sig_pct.config(text="N/A", fg=cfg.COLOR_TEXT_MUTED)
+                self.sig_bar["value"] = 0
 
             self.labels["wifi_radio"].config(text=w.radio_type if w.radio_type else "802.11 Standard")
             self.labels["wifi_channel"].config(text=f"Channel {w.channel}" if w.channel else "Auto")
             self.labels["wifi_rx"].config(text=f"{w.receive_rate_mbps} Mbps" if w.receive_rate_mbps > 0 else "N/A")
             self.labels["wifi_tx"].config(text=f"{w.transmit_rate_mbps} Mbps" if w.transmit_rate_mbps > 0 else "N/A")
-        else:
-            self.labels["wifi_status"].config(text="Wired / Ethernet Connection", fg=cfg.COLOR_TEXT_PRIMARY)
+        elif not a.is_up:
+            self.labels["wifi_status"].config(text="Not connected", fg=cfg.COLOR_TEXT_MUTED)
+            self.labels["wifi_ssid"].config(text="Not available")
+            self.labels["wifi_bssid"].config(text="Not available")
+            self.lbl_sig_pct.config(text="N/A", fg=cfg.COLOR_TEXT_MUTED)
+            self.sig_bar["value"] = 0
+            self.labels["wifi_radio"].config(text="Not available")
+            self.labels["wifi_channel"].config(text="Not available")
+            self.labels["wifi_rx"].config(text="Not available")
+            self.labels["wifi_tx"].config(text="Not available")
+        elif a.adapter_type == "Ethernet":
+            self.labels["wifi_status"].config(text="Wired Ethernet", fg=cfg.COLOR_TEXT_PRIMARY)
             self.labels["wifi_ssid"].config(text="N/A (Wired)")
             self.labels["wifi_bssid"].config(text="N/A (Wired)")
-            self.lbl_sig_pct.config(text="100% (Wired)", fg=cfg.COLOR_SUCCESS)
-            self.sig_bar["value"] = 100
+            self.lbl_sig_pct.config(text="N/A (Wired)", fg=cfg.COLOR_TEXT_MUTED)
+            self.sig_bar["value"] = 0
             self.labels["wifi_radio"].config(text="IEEE 802.3 Ethernet")
-            self.labels["wifi_channel"].config(text="N/A (Cable Link)")
-            self.labels["wifi_rx"].config(text=f"{a.speed_mbps} Mbps" if a.speed_mbps > 0 else "1000 Mbps")
-            self.labels["wifi_tx"].config(text=f"{a.speed_mbps} Mbps" if a.speed_mbps > 0 else "1000 Mbps")
+            self.labels["wifi_channel"].config(text="N/A (Wired)")
+            rate = f"{a.speed_mbps} Mbps" if a.speed_mbps > 0 else "Not reported"
+            self.labels["wifi_rx"].config(text=rate)
+            self.labels["wifi_tx"].config(text=rate)
+        else:
+            self.labels["wifi_status"].config(text="Connected (Wi-Fi details unavailable)", fg=cfg.COLOR_TEXT_MUTED)
+            self.labels["wifi_ssid"].config(text="Not available")
+            self.labels["wifi_bssid"].config(text="Not available")
+            self.lbl_sig_pct.config(text="N/A", fg=cfg.COLOR_TEXT_MUTED)
+            self.sig_bar["value"] = 0
+            self.labels["wifi_radio"].config(text="Not available")
+            self.labels["wifi_channel"].config(text="Not available")
+            self.labels["wifi_rx"].config(text="Not reported")
+            self.labels["wifi_tx"].config(text="Not reported")
 
         # DNS
         self.labels["dns_status"].config(

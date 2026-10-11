@@ -1,19 +1,12 @@
 """
 network_diagnostics.py — IntelliNet Network Probe Layer
-Extended for IntelliNet Phase 1.
-
-Changes from original:
-  - Fixed: socket.setdefaulttimeout() global call removed; per-socket timeouts used instead.
-  - Fixed: route print used as PRIMARY gateway method (language-independent); ipconfig as fallback.
-  - Added: get_wifi_info()       — SSID, signal strength, radio type via netsh wlan
-  - Added: get_interface_stats() — bytes sent/received deltas via psutil
-  - Preserved: all original function signatures for backward compatibility.
+Windows-oriented network probes with bounded subprocess and socket calls.
+Adapter-scoped lookups avoid mixing IP, gateway, and traffic data across interfaces.
 """
 
 import subprocess
 import socket
 import re
-import time
 import json
 import psutil
 import sys
@@ -27,7 +20,7 @@ import config as cfg
 
 # ── Subprocess helper ────────────────────────────────────────────────────────
 
-def _run_cmd(cmd: list, timeout: int = 6) -> str:
+def _run_cmd(cmd: list, timeout: int = cfg.NETWORK_COMMAND_TIMEOUT_SEC) -> str:
     """Run a Windows command silently and return stdout as string."""
     try:
         flags = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0
@@ -69,7 +62,7 @@ def get_active_adapter():
                 for addr in addrs[iface_name]:
                     if addr.family == socket.AF_INET:
                         ip = addr.address
-                        if not ip.startswith("127."):
+                        if not ip.startswith(("127.", "169.254.")):
                             active_adapters.append((iface_name, ip))
 
         if not active_adapters:
@@ -79,7 +72,15 @@ def get_active_adapter():
                     return (True, iface_name, f"Connected ({iface_name})")
             return (False, "None", "No active network adapter detected")
 
-        # Prefer Wi-Fi or Ethernet by keyword priority
+        # Prefer the interface used by the active default route. This avoids
+        # pairing a Wi-Fi address with an Ethernet/VPN gateway on multi-adapter PCs.
+        route_ip = _get_default_route_interface_ip()
+        if route_ip:
+            for iface_name, ip in active_adapters:
+                if ip == route_ip:
+                    return (True, iface_name, iface_name)
+
+        # Fall back to a familiar physical adapter when route output is unavailable.
         best = active_adapters[0][0]
         for iface_name, _ in active_adapters:
             if any(kw in iface_name.lower() for kw in priority_keywords):
@@ -105,14 +106,18 @@ def get_ipv4_address(adapter_name=None):
     try:
         addrs = psutil.net_if_addrs()
 
-        if adapter_name and adapter_name in addrs:
-            for addr in addrs[adapter_name]:
+        if adapter_name:
+            # Never borrow an address from another interface. That can report a
+            # VPN/Ethernet lease as the Wi-Fi adapter's address when the latter
+            # is disconnected or still has only an APIPA address.
+            for addr in addrs.get(adapter_name, []):
                 if addr.family == socket.AF_INET:
                     ip = addr.address
                     if not ip.startswith("127.") and not ip.startswith("169.254."):
                         return (True, ip, ip)
                     elif ip.startswith("169.254."):
                         return (False, "Not Available", f"APIPA Self-Assigned IP ({ip})")
+            return (False, "Not Available", "No valid IPv4 address assigned to the selected adapter")
 
         # Fallback: search all non-loopback adapters
         for iface_name, addr_list in addrs.items():
@@ -132,7 +137,26 @@ def get_ipv4_address(adapter_name=None):
 
 # ── 3. Default Gateway Detection ──────────────────────────────────────────────
 
-def get_default_gateway():
+def _get_default_route_rows(output: str):
+    """Parse numeric gateway/interface pairs from Windows route output."""
+    return re.findall(
+        r"0\.0\.0\.0\s+0\.0\.0\.0\s+([\d.]+)\s+([\d.]+)",
+        output,
+    )
+
+
+def _get_default_route_interface_ip():
+    try:
+        output = _run_cmd(["route", "print", "0.0.0.0"])
+        for gateway, interface_ip in _get_default_route_rows(output):
+            if gateway != "0.0.0.0" and not gateway.startswith("127."):
+                return interface_ip
+    except Exception:
+        return None
+    return None
+
+
+def get_default_gateway(adapter_name=None):
     """
     Determine default gateway.
 
@@ -144,14 +168,28 @@ def get_default_gateway():
     """
     try:
         # PRIMARY: route print — language-independent
-        out = _run_cmd(["route", "print", "0.0.0.0"], timeout=6)
-        matches = re.findall(r"0\.0\.0\.0\s+0\.0\.0\.0\s+([\d\.]+)", out)
-        valid = [g for g in matches if g not in ("0.0.0.0",) and not g.startswith("127.")]
+        out = _run_cmd(["route", "print", "0.0.0.0"])
+        rows = _get_default_route_rows(out)
+        valid = [
+            (gateway, interface_ip)
+            for gateway, interface_ip in rows
+            if gateway != "0.0.0.0" and not gateway.startswith("127.")
+        ]
+        if adapter_name:
+            addrs = psutil.net_if_addrs().get(adapter_name, [])
+            adapter_ips = {
+                addr.address for addr in addrs
+                if addr.family == socket.AF_INET and not addr.address.startswith(("127.", "169.254."))
+            }
+            matching = [gateway for gateway, interface_ip in valid if interface_ip in adapter_ips]
+            return matching[0] if matching else None
         if valid:
-            return valid[0]
+            return valid[0][0]
 
         # FALLBACK: ipconfig (English Windows only)
-        out2 = _run_cmd(["ipconfig"], timeout=6)
+        if adapter_name:
+            return None
+        out2 = _run_cmd(["ipconfig"])
         matches2 = re.findall(r"Default Gateway[ .:]+(\d[\d\.]+)", out2)
         valid2 = [g for g in matches2 if g != "0.0.0.0" and not g.startswith("127.")]
         if valid2:
@@ -179,7 +217,7 @@ def get_dns_servers(adapter_name=None):
     )
     output = _run_cmd(
         ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
-        timeout=8,
+        timeout=cfg.DNS_SERVER_QUERY_TIMEOUT_SEC,
     )
     try:
         values = json.loads(output)
@@ -192,7 +230,7 @@ def get_dns_servers(adapter_name=None):
     return [str(value) for value in values if value]
 
 
-def ping_host(host: str, timeout_sec: int = 2) -> bool:
+def ping_host(host: str, timeout_sec: int = cfg.QUICK_PING_TIMEOUT) -> bool:
     """
     Single ICMP ping using Windows ping command.
 
@@ -204,7 +242,7 @@ def ping_host(host: str, timeout_sec: int = 2) -> bool:
     try:
         timeout_ms = int(timeout_sec * 1000)
         out = _run_cmd(["ping", "-n", "1", "-w", str(timeout_ms), host],
-                       timeout=timeout_sec + 3)
+                       timeout=timeout_sec + cfg.PING_QUICK_TIMEOUT_BUFFER_SEC)
         out_lower = out.lower()
         return (
             "ttl=" in out_lower or
@@ -215,14 +253,14 @@ def ping_host(host: str, timeout_sec: int = 2) -> bool:
         return False
 
 
-def check_gateway():
+def check_gateway(adapter_name=None):
     """
     Detect gateway and test reachability via ping.
 
     Returns:
         (has_gateway: bool, gateway_ip: str, is_reachable: bool, display_str: str)
     """
-    gw = get_default_gateway()
+    gw = get_default_gateway(adapter_name)
     if not gw:
         return (False, "Not Available", False, "Not Available")
     reachable = ping_host(gw, timeout_sec=cfg.QUICK_PING_TIMEOUT)
@@ -234,16 +272,57 @@ def check_gateway():
 
 # ── 4. DNS Resolution ────────────────────────────────────────────────────────
 
-def check_dns(domain: str = "google.com"):
+def check_dns(domain: str = cfg.DNS_TEST_DOMAIN):
     """
-    Test DNS resolution using a per-socket timeout (does NOT modify global socket timeout).
+    Test DNS resolution with a bounded timeout on Windows.
 
     Returns:
         (is_working: bool, status_str: str, details: str)
     """
+    if sys.platform == "win32":
+        # getaddrinfo has no per-call timeout. Use the Windows DNS client in a
+        # child process so a stuck resolver can be terminated without freezing
+        # the diagnostic or monitoring worker indefinitely.
+        safe_domain = str(domain).replace("'", "''")
+        script = (
+            "$ErrorActionPreference = 'Stop'; "
+            f"$addresses = Resolve-DnsName -Name '{safe_domain}' -Type A -DnsOnly "
+            "-ErrorAction Stop | Where-Object { $_.IPAddress } "
+            "| Select-Object -ExpandProperty IPAddress; "
+            "if (-not $addresses) { exit 1 }; "
+            "ConvertTo-Json -InputObject @($addresses) -Compress"
+        )
+        try:
+            flags = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0
+            result = subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+                capture_output=True,
+                text=True,
+                timeout=cfg.DNS_SOCKET_TIMEOUT_SEC,
+                creationflags=flags,
+                check=False,
+            )
+            if result.returncode != 0:
+                detail = (result.stderr or "DNS query returned no addresses").strip()
+                return (False, "Failed", f"Failed to resolve {domain}: {detail}")
+            addresses = json.loads(result.stdout or "[]")
+            if isinstance(addresses, str):
+                addresses = [addresses]
+            if addresses:
+                return (True, "Working", f"Resolved {domain} -> {addresses[0]}")
+            return (False, "Failed", f"No result for {domain}")
+        except subprocess.TimeoutExpired:
+            return (False, "Failed", f"DNS lookup timed out after {cfg.DNS_SOCKET_TIMEOUT_SEC}s ({domain})")
+        except FileNotFoundError:
+            return (False, "Failed", "PowerShell DNS query utility was not found")
+        except (TypeError, ValueError) as exc:
+            return (False, "Failed", f"Invalid DNS query response: {exc}")
+        except Exception as exc:
+            return (False, "Failed", f"DNS query error: {exc}")
+
+    # Non-Windows fallback for the diagnostic module's unit tests and CLI use.
+    # Windows is the supported desktop platform and uses the bounded process above.
     try:
-        # getaddrinfo handles resolution without needing a socket object.
-        # We avoid setdefaulttimeout() which is global and affects all sockets.
         result = socket.getaddrinfo(domain, None, socket.AF_INET,
                                     socket.SOCK_STREAM,
                                     0, socket.AI_ADDRCONFIG)
@@ -280,10 +359,11 @@ def check_internet(target_ip: str = cfg.PING_TARGET_PRIMARY):
 
     # TCP fallback (port 53 — DNS port on 8.8.8.8 is rarely blocked)
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(2)
-        s.connect((cfg.TCP_FALLBACK_HOST, cfg.TCP_FALLBACK_PORT))
-        s.close()
+        with socket.create_connection(
+            (cfg.TCP_FALLBACK_HOST, cfg.TCP_FALLBACK_PORT),
+            timeout=cfg.TCP_FALLBACK_TIMEOUT_SEC,
+        ):
+            pass
         return (True, "Connected", f"TCP connected ({cfg.TCP_FALLBACK_HOST}:{cfg.TCP_FALLBACK_PORT})")
     except Exception:
         pass
@@ -299,7 +379,7 @@ def get_wifi_info() -> WiFiInfo:
     Returns WiFiInfo(is_wifi=False) when on Ethernet or Wi-Fi is disconnected.
     """
     try:
-        out = _run_cmd(["netsh", "wlan", "show", "interfaces"], timeout=6)
+        out = _run_cmd(["netsh", "wlan", "show", "interfaces"])
 
         if not out.strip():
             return WiFiInfo(is_wifi=False, display="Ethernet (No Wi-Fi adapter)")
@@ -365,10 +445,12 @@ def get_interface_stats(adapter_name: str = None) -> dict:
     """
     try:
         counters = psutil.net_io_counters(pernic=True)
-        if adapter_name and adapter_name in counters:
-            c = counters[adapter_name]
+        if adapter_name:
+            c = counters.get(adapter_name)
+            if c is None:
+                return {}
         else:
-            c = psutil.net_io_counters()   # System-wide total
+            c = psutil.net_io_counters()   # System-wide total only when no adapter was selected
 
         return {
             "bytes_sent":    c.bytes_sent,
@@ -382,64 +464,3 @@ def get_interface_stats(adapter_name: str = None) -> dict:
         }
     except Exception:
         return {}
-
-
-# ── 8. Legacy diagnose_network (preserved for backward compatibility) ──────────
-
-def diagnose_network(adapter_res, ip_res, gateway_res, dns_res, internet_res):
-    """
-    Original rule-based diagnostic engine — preserved for backward compatibility.
-    New code should use rca_engine.analyze() instead.
-    """
-    adapter_ok, adapter_name, _ = adapter_res
-    ip_ok, ip_addr, _           = ip_res
-    gw_has, gw_ip, gw_reachable, _ = gateway_res
-    dns_ok, _, _                = dns_res
-    internet_ok, _, _           = internet_res
-
-    if not adapter_ok or adapter_name == "None":
-        return {"overall_status": "CRITICAL - ADAPTER DISCONNECTED",
-                "diagnosis": "Network adapter is disconnected or disabled.",
-                "recommendation": "Connect to Wi-Fi or Ethernet and retry.",
-                "case_code": "CASE_1"}
-
-    if not ip_ok or ip_addr == "Not Available":
-        return {"overall_status": "CRITICAL - NO IP ASSIGNED",
-                "diagnosis": "No valid IP address has been assigned.",
-                "recommendation": "Reconnect to the network or renew the IP configuration.",
-                "case_code": "CASE_2"}
-
-    if not gw_has or not gw_reachable:
-        return {"overall_status": "WARNING - GATEWAY UNREACHABLE",
-                "diagnosis": "Local network or default gateway connectivity problem.",
-                "recommendation": "Check the router, Wi-Fi connection, or local network configuration.",
-                "case_code": "CASE_3"}
-
-    if gw_reachable and internet_ok and not dns_ok:
-        return {"overall_status": "WARNING - DNS FAILURE",
-                "diagnosis": "DNS resolution problem.",
-                "recommendation": "Check DNS configuration or try an alternative DNS server.",
-                "case_code": "CASE_4"}
-
-    if gw_reachable and dns_ok and not internet_ok:
-        return {"overall_status": "WARNING - INTERNET UNREACHABLE",
-                "diagnosis": "Internet connectivity problem.",
-                "recommendation": "Check router internet access or ISP connectivity.",
-                "case_code": "CASE_5"}
-
-    if gw_reachable and dns_ok and internet_ok:
-        return {"overall_status": "NORMAL - CONNECTION ONLINE",
-                "diagnosis": "Network connection is functioning normally.",
-                "recommendation": "No action required.",
-                "case_code": "CASE_6"}
-
-    if gw_reachable and not dns_ok and not internet_ok:
-        return {"overall_status": "WARNING - NO INTERNET ACCESS",
-                "diagnosis": "Gateway reachable but WAN Internet connection is offline.",
-                "recommendation": "Check router internet connection or contact your ISP.",
-                "case_code": "CASE_HYBRID"}
-
-    return {"overall_status": "WARNING - UNKNOWN NETWORK STATE",
-            "diagnosis": "Inconsistent network parameters detected.",
-            "recommendation": "Restart your network adapter and retry the diagnostic.",
-            "case_code": "CASE_UNKNOWN"}

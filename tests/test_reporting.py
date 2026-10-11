@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 
@@ -127,6 +128,23 @@ class DiagnosticReportTests(unittest.TestCase):
     def test_empty_action_history_is_explicit(self):
         actions = dict(build_report_sections(sample_result())[-1][1])
         self.assertIn("No actions performed", actions)
+
+    def test_report_distinguishes_measured_packet_loss_from_missing_latency(self):
+        result = sample_result()
+        result.performance = replace(
+            result.performance,
+            avg_latency_ms=-1,
+            min_latency_ms=-1,
+            max_latency_ms=-1,
+            jitter_ms=-1,
+            packet_loss_pct=100,
+            error="No ICMP echo replies received",
+        )
+
+        performance_rows = dict(build_report_sections(result)[2][1])
+
+        self.assertEqual(performance_rows["Latency"], "Unavailable — no ICMP echo replies received")
+        self.assertEqual(performance_rows["Packet loss"], "100.0%")
 
 
 if __name__ == "__main__":

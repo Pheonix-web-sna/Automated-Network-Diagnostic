@@ -5,8 +5,9 @@ No imports from other IntelliNet modules (zero circular dependency).
 """
 
 from dataclasses import dataclass, field
-from typing import List, Dict, Optional
+from typing import List, Dict
 from datetime import datetime
+import config as cfg
 
 
 @dataclass
@@ -64,7 +65,7 @@ class DNSInfo:
 
 @dataclass
 class InternetInfo:
-    """Internet connectivity test result (via direct IP ping, no DNS)."""
+    """Internet reachability test using direct-IP ICMP or TCP, without DNS."""
     is_connected: bool
     target_ip: str
     method: str = ""    # "ICMP" or "TCP"
@@ -91,6 +92,11 @@ class PerformanceMetrics:
         return self.avg_latency_ms >= 0
 
     @property
+    def has_packet_measurement(self) -> bool:
+        """Whether a ping sequence ran and produced a usable loss measurement."""
+        return self.ping_count > 0 and 0 <= self.packet_loss_pct <= 100
+
+    @property
     def latency_display(self) -> str:
         if not self.is_valid:
             return "N/A"
@@ -103,7 +109,7 @@ class PerformanceMetrics:
 
     @property
     def loss_display(self) -> str:
-        if not self.is_valid:
+        if not self.has_packet_measurement:
             return "N/A"
         received = round(self.ping_count * (1 - self.packet_loss_pct / 100))
         lost = self.ping_count - received
@@ -115,13 +121,13 @@ class PerformanceMetrics:
         if not self.is_valid:
             return "Unknown"
         lat = self.avg_latency_ms
-        if lat <= 30:
+        if lat <= cfg.LATENCY_EXCELLENT_MS:
             return "Excellent"
-        elif lat <= 60:
+        elif lat <= cfg.LATENCY_GOOD_MS:
             return "Good"
-        elif lat <= 100:
+        elif lat <= cfg.LATENCY_FAIR_MS:
             return "Fair"
-        elif lat <= 200:
+        elif lat <= cfg.LATENCY_POOR_MS:
             return "Poor"
         else:
             return "Very Poor"

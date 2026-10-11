@@ -168,12 +168,12 @@ class DashboardView(tk.Frame):
 
         self.comp_labels = {}
         components = [
-            ("adapter", "Adapter State", "20 pts"),
-            ("ip", "IP Configuration", "20 pts"),
-            ("gateway", "Gateway Reachability", "20 pts"),
-            ("dns", "DNS Resolution", "15 pts"),
-            ("internet", "Internet Access", "15 pts"),
-            ("performance", "Latency & Loss", "10 pts"),
+            ("adapter", "Adapter State", cfg.HEALTH_WEIGHTS["adapter"]),
+            ("ip", "IP Configuration", cfg.HEALTH_WEIGHTS["ip"]),
+            ("gateway", "Gateway Reachability", cfg.HEALTH_WEIGHTS["gateway"]),
+            ("dns", "DNS Resolution", cfg.HEALTH_WEIGHTS["dns"]),
+            ("internet", "Internet Access", cfg.HEALTH_WEIGHTS["internet"]),
+            ("performance", "Latency & Loss", cfg.HEALTH_WEIGHTS["latency"] + cfg.HEALTH_WEIGHTS["packet_loss"]),
         ]
 
         for cid, cname, cweight in components:
@@ -192,7 +192,7 @@ class DashboardView(tk.Frame):
 
             val_lbl = tk.Label(
                 row,
-                text=f"— / {cweight}",
+                text=f"— / {cweight} pts",
                 font=("Segoe UI", 8, "bold"),
                 bg=cfg.COLOR_PANEL,
                 fg=cfg.COLOR_TEXT_MUTED,
@@ -408,34 +408,34 @@ class DashboardView(tk.Frame):
         c = hlth.components
         if "adapter" in c:
             self.comp_labels["adapter"].config(
-                text=f"{c['adapter']} / 20 pts",
-                fg=cfg.COLOR_SUCCESS if c["adapter"] == 20 else cfg.COLOR_FAILURE,
+                text=f"{c['adapter']} / {cfg.HEALTH_WEIGHTS['adapter']} pts",
+                fg=cfg.COLOR_SUCCESS if c["adapter"] == cfg.HEALTH_WEIGHTS["adapter"] else cfg.COLOR_FAILURE,
             )
         if "ip" in c:
             self.comp_labels["ip"].config(
-                text=f"{c['ip']} / 20 pts",
-                fg=cfg.COLOR_SUCCESS if c["ip"] == 20 else cfg.COLOR_FAILURE,
+                text=f"{c['ip']} / {cfg.HEALTH_WEIGHTS['ip']} pts",
+                fg=cfg.COLOR_SUCCESS if c["ip"] == cfg.HEALTH_WEIGHTS["ip"] else cfg.COLOR_FAILURE,
             )
         if "gateway" in c:
             self.comp_labels["gateway"].config(
-                text=f"{c['gateway']} / 20 pts",
-                fg=cfg.COLOR_SUCCESS if c["gateway"] == 20 else cfg.COLOR_FAILURE,
+                text=f"{c['gateway']} / {cfg.HEALTH_WEIGHTS['gateway']} pts",
+                fg=cfg.COLOR_SUCCESS if c["gateway"] == cfg.HEALTH_WEIGHTS["gateway"] else cfg.COLOR_FAILURE,
             )
         if "dns" in c:
             self.comp_labels["dns"].config(
-                text=f"{c['dns']} / 15 pts",
-                fg=cfg.COLOR_SUCCESS if c["dns"] == 15 else cfg.COLOR_FAILURE,
+                text=f"{c['dns']} / {cfg.HEALTH_WEIGHTS['dns']} pts",
+                fg=cfg.COLOR_SUCCESS if c["dns"] == cfg.HEALTH_WEIGHTS["dns"] else cfg.COLOR_FAILURE,
             )
         if "internet" in c:
             self.comp_labels["internet"].config(
-                text=f"{c['internet']} / 15 pts",
-                fg=cfg.COLOR_SUCCESS if c["internet"] == 15 else cfg.COLOR_FAILURE,
+                text=f"{c['internet']} / {cfg.HEALTH_WEIGHTS['internet']} pts",
+                fg=cfg.COLOR_SUCCESS if c["internet"] == cfg.HEALTH_WEIGHTS["internet"] else cfg.COLOR_FAILURE,
             )
         lat_pts = c.get("latency", 0)
         loss_pts = c.get("packet_loss", 0)
         tot_perf = lat_pts + loss_pts
         self.comp_labels["performance"].config(
-            text=f"{tot_perf} / 10 pts",
+            text=f"{tot_perf} / {cfg.HEALTH_WEIGHTS['latency'] + cfg.HEALTH_WEIGHTS['packet_loss']} pts",
             fg=cfg.COLOR_SUCCESS if tot_perf >= 8 else (cfg.COLOR_WARNING if tot_perf >= 4 else cfg.COLOR_FAILURE),
         )
 
@@ -470,7 +470,7 @@ class DashboardView(tk.Frame):
 
         # ── Card 2: IP & Gateway ──────────────────────────────────────
         self.lbl_ip_addr.config(text=result.ip.ipv4)
-        self.lbl_ip_mask.config(text=result.ip.subnet_mask or "255.255.255.0")
+        self.lbl_ip_mask.config(text=result.ip.subnet_mask or "Not available")
         self.lbl_gw_ip.config(text=result.gateway.ip)
         self.lbl_gw_ping.config(
             text="Reachable ✓" if result.gateway.is_reachable else "Unreachable ✗",
@@ -506,13 +506,26 @@ class DashboardView(tk.Frame):
             )
         else:
             self.lbl_perf_lat.config(text="N/A", fg=cfg.COLOR_TEXT_MUTED)
-            self.lbl_perf_loss.config(text="N/A", fg=cfg.COLOR_TEXT_MUTED)
+            if perf.has_packet_measurement:
+                loss_color = cfg.COLOR_SUCCESS if perf.packet_loss_pct <= cfg.LOSS_GOOD_PCT else cfg.COLOR_FAILURE
+                self.lbl_perf_loss.config(text=f"{perf.packet_loss_pct:.0f}%", fg=loss_color)
+            else:
+                self.lbl_perf_loss.config(text="N/A", fg=cfg.COLOR_TEXT_MUTED)
 
         w = result.wifi
         if w.is_wifi:
             self.lbl_wifi_ssid.config(text=w.ssid[:14] if w.ssid else "Connected")
-            sig_color = cfg.COLOR_SUCCESS if w.signal_pct >= 70 else (cfg.COLOR_WARNING if w.signal_pct >= 40 else cfg.COLOR_FAILURE)
-            self.lbl_wifi_sig.config(text=f"{w.signal_pct}%" if w.signal_pct >= 0 else "Connected", fg=sig_color)
+            if w.signal_pct >= 0:
+                sig_color = cfg.COLOR_SUCCESS if w.signal_pct >= 70 else (cfg.COLOR_WARNING if w.signal_pct >= 40 else cfg.COLOR_FAILURE)
+                self.lbl_wifi_sig.config(text=f"{w.signal_pct}%", fg=sig_color)
+            else:
+                self.lbl_wifi_sig.config(text="N/A", fg=cfg.COLOR_TEXT_MUTED)
+        elif a.is_up and a.adapter_type == "Ethernet":
+            self.lbl_wifi_ssid.config(text="Wired Ethernet")
+            self.lbl_wifi_sig.config(text="N/A (wired)", fg=cfg.COLOR_TEXT_MUTED)
+        elif a.is_up:
+            self.lbl_wifi_ssid.config(text="Not available")
+            self.lbl_wifi_sig.config(text="N/A", fg=cfg.COLOR_TEXT_MUTED)
         else:
-            self.lbl_wifi_ssid.config(text="Wired / LAN")
-            self.lbl_wifi_sig.config(text="100% (Ethernet)", fg=cfg.COLOR_SUCCESS)
+            self.lbl_wifi_ssid.config(text="Not connected")
+            self.lbl_wifi_sig.config(text="N/A", fg=cfg.COLOR_TEXT_MUTED)

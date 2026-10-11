@@ -16,23 +16,70 @@ import sqlite3
 import os
 import json
 from datetime import datetime
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict
 
-import sys
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import config as cfg
 from models import DiagnosticResult
 
 
 # ── Database path ─────────────────────────────────────────────────────────────
-DB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
-DB_PATH = os.path.join(DB_DIR, "intellinet.db")
+def _default_data_directory() -> str:
+    """Choose a writable per-user data directory instead of the source tree."""
+    override = os.environ.get("INTELLINET_DATA_DIR")
+    if override:
+        return os.path.abspath(os.path.expandvars(os.path.expanduser(override)))
+    if os.environ.get("LOCALAPPDATA"):
+        base = os.environ["LOCALAPPDATA"]
+    else:
+        base = os.environ.get(
+            "XDG_DATA_HOME",
+            os.path.join(os.path.expanduser("~"), ".local", "share"),
+        )
+    return os.path.join(base, "IntelliNet")
+
+
+DB_DIR = _default_data_directory()
+DB_PATH = os.path.join(DB_DIR, cfg.DB_FILENAME)
+LEGACY_DB_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "data", cfg.DB_FILENAME
+)
+
+
+def _migrate_legacy_database():
+    """Preserve an existing project-local history DB on the first upgraded run."""
+    if os.path.abspath(DB_PATH) == os.path.abspath(LEGACY_DB_PATH):
+        return
+    if os.path.exists(DB_PATH) or not os.path.isfile(LEGACY_DB_PATH):
+        return
+    os.makedirs(DB_DIR, exist_ok=True)
+    source = destination = None
+    migration_failed = False
+    try:
+        # SQLite's backup API includes committed WAL contents, unlike a raw
+        # file copy of a database that may still have sidecar files.
+        source = sqlite3.connect(LEGACY_DB_PATH, timeout=cfg.DB_BUSY_TIMEOUT_SEC)
+        destination = sqlite3.connect(DB_PATH, timeout=cfg.DB_BUSY_TIMEOUT_SEC)
+        source.backup(destination)
+    except (OSError, sqlite3.Error):
+        # A missing/locked legacy DB should not prevent creating a fresh history DB.
+        migration_failed = True
+    finally:
+        if source is not None:
+            source.close()
+        if destination is not None:
+            destination.close()
+    if migration_failed and os.path.exists(DB_PATH):
+        try:
+            os.remove(DB_PATH)
+        except OSError:
+            pass
 
 
 def _get_conn() -> sqlite3.Connection:
     """Create and return a new SQLite connection with WAL mode."""
     os.makedirs(DB_DIR, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH, timeout=10)
+    conn = sqlite3.connect(DB_PATH, timeout=cfg.DB_BUSY_TIMEOUT_SEC)
+    conn.execute(f"PRAGMA busy_timeout={int(cfg.DB_BUSY_TIMEOUT_SEC * 1000)}")
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.row_factory = sqlite3.Row
@@ -41,6 +88,7 @@ def _get_conn() -> sqlite3.Connection:
 
 def init_db():
     """Create all tables if they do not exist."""
+    _migrate_legacy_database()
     conn = _get_conn()
     try:
         conn.executescript("""
@@ -172,7 +220,7 @@ def save_diagnostic(result: DiagnosticResult) -> int:
             result.performance.min_latency_ms,
             result.performance.max_latency_ms,
             result.performance.jitter_ms,
-            result.performance.packet_loss_pct,
+            result.performance.packet_loss_pct if result.performance.has_packet_measurement else None,
             result.performance.ping_count,
             result.health.score,
             json.dumps(result.health.components),
@@ -203,14 +251,33 @@ def save_diagnostic(result: DiagnosticResult) -> int:
 
         conn.execute(
             "INSERT INTO packet_loss_history (timestamp, loss_pct, ping_count) VALUES (?,?,?)",
-            (ts, result.performance.packet_loss_pct, result.performance.ping_count),
+            (
+                ts,
+                result.performance.packet_loss_pct if result.performance.has_packet_measurement else None,
+                result.performance.ping_count,
+            ),
         )
 
         conn.execute(
             "INSERT INTO dns_history (timestamp, domain, is_working, resolved_ip) VALUES (?,?,?,?)",
             (ts, result.dns.domain_tested, int(result.dns.is_working),
-             result.dns.resolved_ip if hasattr(result.dns, 'resolved_ip') else ""),
+             result.dns.resolved_ip),
         )
+
+        # Keep the history database bounded during long-running monitoring.
+        history_limit = max(1, int(cfg.MAX_HISTORY_SESSIONS))
+        for table in (
+            "diagnostic_sessions",
+            "health_history",
+            "latency_history",
+            "packet_loss_history",
+            "dns_history",
+        ):
+            conn.execute(
+                f"DELETE FROM {table} WHERE id NOT IN "
+                f"(SELECT id FROM {table} ORDER BY id DESC LIMIT ?)",
+                (history_limit,),
+            )
 
         conn.commit()
         return session_id
@@ -228,6 +295,11 @@ def log_event(event_type: str, message: str, severity: str = "INFO", details: st
             "INSERT INTO event_log (timestamp, event_type, severity, message, details) VALUES (?,?,?,?,?)",
             (ts, event_type, severity, message, details),
         )
+        conn.execute(
+            "DELETE FROM event_log WHERE id NOT IN "
+            "(SELECT id FROM event_log ORDER BY id DESC LIMIT ?)",
+            (max(1, int(cfg.MAX_EVENT_LOG_ENTRIES)),),
+        )
         conn.commit()
     finally:
         conn.close()
@@ -242,7 +314,8 @@ def get_recent_sessions(limit: int = 50) -> List[Dict]:
     conn = _get_conn()
     try:
         rows = conn.execute(
-            "SELECT * FROM diagnostic_sessions ORDER BY id DESC LIMIT ?", (limit,)
+            "SELECT * FROM diagnostic_sessions ORDER BY id DESC LIMIT ?",
+            (max(1, min(int(limit), cfg.MAX_HISTORY_SESSIONS)),),
         ).fetchall()
         return [dict(r) for r in rows]
     finally:
@@ -254,7 +327,8 @@ def get_health_history(limit: int = 100) -> List[Dict]:
     conn = _get_conn()
     try:
         rows = conn.execute(
-            "SELECT timestamp, score, label FROM health_history ORDER BY id DESC LIMIT ?", (limit,)
+            "SELECT timestamp, score, label FROM health_history ORDER BY id DESC LIMIT ?",
+            (max(1, min(int(limit), cfg.MAX_HISTORY_SESSIONS)),),
         ).fetchall()
         return [dict(r) for r in reversed(rows)]
     finally:
@@ -267,7 +341,7 @@ def get_latency_history(limit: int = 100) -> List[Dict]:
     try:
         rows = conn.execute(
             "SELECT timestamp, avg_ms, min_ms, max_ms, jitter_ms FROM latency_history ORDER BY id DESC LIMIT ?",
-            (limit,),
+            (max(1, min(int(limit), cfg.MAX_HISTORY_SESSIONS)),),
         ).fetchall()
         return [dict(r) for r in reversed(rows)]
     finally:
@@ -280,7 +354,7 @@ def get_packet_loss_history(limit: int = 100) -> List[Dict]:
     try:
         rows = conn.execute(
             "SELECT timestamp, loss_pct, ping_count FROM packet_loss_history ORDER BY id DESC LIMIT ?",
-            (limit,),
+            (max(1, min(int(limit), cfg.MAX_HISTORY_SESSIONS)),),
         ).fetchall()
         return [dict(r) for r in reversed(rows)]
     finally:
@@ -293,7 +367,7 @@ def get_dns_history(limit: int = 100) -> List[Dict]:
     try:
         rows = conn.execute(
             "SELECT timestamp, domain, is_working, resolved_ip FROM dns_history ORDER BY id DESC LIMIT ?",
-            (limit,),
+            (max(1, min(int(limit), cfg.MAX_HISTORY_SESSIONS)),),
         ).fetchall()
         return [dict(r) for r in reversed(rows)]
     finally:
@@ -306,7 +380,7 @@ def get_event_log(limit: int = 200) -> List[Dict]:
     try:
         rows = conn.execute(
             "SELECT timestamp, event_type, severity, message, details FROM event_log ORDER BY id DESC LIMIT ?",
-            (limit,),
+            (max(1, min(int(limit), cfg.MAX_EVENT_LOG_ENTRIES)),),
         ).fetchall()
         return [dict(r) for r in rows]
     finally:
@@ -337,7 +411,10 @@ def get_event_count() -> int:
 # DEGRADATION DETECTION
 # ═══════════════════════════════════════════════════════════════
 
-def detect_degradation(current_result: DiagnosticResult, window: int = 10) -> List[str]:
+def detect_degradation(
+    current_result: DiagnosticResult,
+    window: int = cfg.DEGRADE_WINDOW_SIZE,
+) -> List[str]:
     """
     Compare current diagnostic result against recent history to detect degradation.
 
@@ -358,7 +435,7 @@ def detect_degradation(current_result: DiagnosticResult, window: int = 10) -> Li
         avg_health = sum(d["score"] for d in health_data) / len(health_data)
         current_health = current_result.health.score
         drop = avg_health - current_health
-        if drop > 15:
+        if drop > cfg.DEGRADE_HEALTH_DROP_PTS:
             alerts.append(
                 f"Health score dropped to {current_health} "
                 f"(avg of last {len(health_data)} scans: {avg_health:.0f}, drop: {drop:.0f} pts)"
@@ -370,7 +447,8 @@ def detect_degradation(current_result: DiagnosticResult, window: int = 10) -> Li
     if valid_latencies and current_result.performance.is_valid:
         avg_lat = sum(valid_latencies) / len(valid_latencies)
         cur_lat = current_result.performance.avg_latency_ms
-        if avg_lat > 0 and cur_lat > avg_lat * 1.5:
+        latency_limit = 1 + cfg.DEGRADE_LATENCY_INCREASE_PCT / 100
+        if avg_lat > 0 and cur_lat > avg_lat * latency_limit:
             alerts.append(
                 f"Latency spike detected: {cur_lat:.0f}ms "
                 f"(historical avg: {avg_lat:.0f}ms, +{((cur_lat - avg_lat)/avg_lat)*100:.0f}%)"
@@ -379,10 +457,10 @@ def detect_degradation(current_result: DiagnosticResult, window: int = 10) -> Li
     # Packet loss comparison
     loss_data = get_packet_loss_history(limit=window)
     valid_losses = [d["loss_pct"] for d in loss_data if d["loss_pct"] is not None]
-    if valid_losses and current_result.performance.is_valid:
+    if valid_losses and current_result.performance.has_packet_measurement:
         avg_loss = sum(valid_losses) / len(valid_losses)
         cur_loss = current_result.performance.packet_loss_pct
-        if cur_loss > avg_loss + 3:
+        if cur_loss > avg_loss + cfg.DEGRADE_LOSS_INCREASE_PCT:
             alerts.append(
                 f"Packet loss increased: {cur_loss:.0f}% "
                 f"(historical avg: {avg_loss:.1f}%)"
@@ -404,6 +482,3 @@ def detect_degradation(current_result: DiagnosticResult, window: int = 10) -> Li
 # ═══════════════════════════════════════════════════════════════
 # INITIALIZATION
 # ═══════════════════════════════════════════════════════════════
-
-# Auto-initialize database on import
-init_db()
